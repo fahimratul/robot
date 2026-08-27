@@ -239,6 +239,10 @@ PHONE_PAGE_HTML = """<!doctype html>
   button.stop { color:#ff3b5c; border-color:#ff3b5c; }
   button.selected { background:#ff2ea6; color:#020508; }
   .obstacle { text-align:center; margin-top:16px; font-weight:bold; min-height:1.2em; }
+  .radar-wrap { display:flex; justify-content:center; margin-top:10px; }
+  #radar { background:#020508; border:1px solid #0a5f70; border-radius:8px; max-width:100%; }
+  .radar-legend { text-align:center; font-size:0.7rem; color:#5b7a94; margin-top:4px; }
+  .radar-legend span { padding:0 6px; }
   .alertbar { display:none; text-align:center; font-weight:bold; padding:12px; border-radius:10px;
               margin-bottom:14px; background:#3a0a14; color:#ff3b5c; border:1px solid #ff3b5c; }
   body.alerting .alertbar { animation: flash 0.6s step-start infinite; }
@@ -262,6 +266,15 @@ PHONE_PAGE_HTML = """<!doctype html>
     <button class="stop" onclick="post('/api/stop')">&#9632; STOP</button>
   </div>
   <div class="obstacle" id="obstacle"></div>
+
+  <div class="radar-wrap">
+    <canvas id="radar" width="320" height="320"></canvas>
+  </div>
+  <div class="radar-legend">
+    <span style="color:#ff3b5c">&#9679; blocked</span>
+    <span style="color:#ffb800">&#9679; front (clear)</span>
+    <span style="color:#00e5ff">&#9679; behind</span>
+  </div>
 
   <div class="manual-wrap">
     <button id="manualBtn" onclick="post('/api/manual/on')">&#9998; TAKE MANUAL CONTROL</button>
@@ -303,6 +316,90 @@ document.querySelectorAll('.dbtn').forEach(function(btn) {
   });
 });
 
+// ---- LiDAR radar canvas ----
+const radar = document.getElementById('radar');
+const radarCtx = radar.getContext('2d');
+function sizeRadar() {
+  const side = Math.min(radar.parentElement.clientWidth, 420);
+  radar.width = side;
+  radar.height = side;
+}
+sizeRadar();
+window.addEventListener('resize', sizeRadar);
+
+function drawRadar(scan) {
+  const w = radar.width, h = radar.height;
+  const cx = w / 2, cy = h / 2;
+  const maxR = Math.min(w, h) / 2 - 10;
+  const maxRangeMm = scan.max_range_mm;
+  const scale = maxR / maxRangeMm;
+  const threshold = scan.threshold_mm;
+  const frontHalf = scan.front_half_angle;
+
+  radarCtx.clearRect(0, 0, w, h);
+  radarCtx.fillStyle = '#020508';
+  radarCtx.fillRect(0, 0, w, h);
+
+  // Shade the front-180 sector (heading 0 = straight up)
+  radarCtx.beginPath();
+  radarCtx.moveTo(cx, cy);
+  radarCtx.arc(cx, cy, maxR, Math.PI, 2 * Math.PI);
+  radarCtx.closePath();
+  radarCtx.fillStyle = '#0a1f2e';
+  radarCtx.fill();
+
+  // Range rings
+  [0.25, 0.5, 0.75, 1.0].forEach(function(frac) {
+    radarCtx.beginPath();
+    radarCtx.arc(cx, cy, maxR * frac, 0, 2 * Math.PI);
+    radarCtx.strokeStyle = '#0a5f70';
+    radarCtx.lineWidth = 1;
+    radarCtx.stroke();
+  });
+  radarCtx.beginPath();
+  radarCtx.arc(cx, cy, maxR, 0, 2 * Math.PI);
+  radarCtx.strokeStyle = '#00e5ff';
+  radarCtx.lineWidth = 2;
+  radarCtx.stroke();
+
+  // Robot marker (heading = straight up)
+  radarCtx.fillStyle = '#00e5ff';
+  radarCtx.beginPath();
+  radarCtx.moveTo(cx, cy - 10);
+  radarCtx.lineTo(cx - 6, cy + 6);
+  radarCtx.lineTo(cx + 6, cy + 6);
+  radarCtx.closePath();
+  radarCtx.fill();
+
+  scan.points.forEach(function(p) {
+    const angleDeg = p[0], distMm = p[1];
+    const r = Math.min(distMm, maxRangeMm) * scale;
+    const theta = (angleDeg - 90) * Math.PI / 180;  // rotate so 0deg = up
+    const x = cx + r * Math.cos(theta);
+    const y = cy + r * Math.sin(theta);
+    const a = ((angleDeg % 360) + 360) % 360;
+    const inFront = a <= frontHalf || a >= (360 - frontHalf);
+
+    let color;
+    if (inFront && distMm <= threshold) color = '#ff3b5c';
+    else if (inFront) color = '#ffb800';
+    else color = '#00e5ff';
+
+    radarCtx.fillStyle = color;
+    radarCtx.beginPath();
+    radarCtx.arc(x, y, 2.5, 0, 2 * Math.PI);
+    radarCtx.fill();
+  });
+}
+
+async function pollScan() {
+  try {
+    const r = await fetch('/api/scan');
+    const scan = await r.json();
+    drawRadar(scan);
+  } catch (e) {}
+}
+
 let lastAlert = false;
 function beep() {
   try {
@@ -336,7 +433,9 @@ async function poll() {
     document.getElementById('t1').className = s.table === 1 ? 'selected' : '';
     document.getElementById('t2').className = s.table === 2 ? 'selected' : '';
     const obEl = document.getElementById('obstacle');
-    obEl.textContent = s.obstacle ? '\\u26A0 OBSTACLE DETECTED' : '';
+    obEl.textContent = s.obstacle
+      ? ('\\u26A0 OBSTACLE' + (s.obstacle_dist_mm ? ' AT ' + s.obstacle_dist_mm + 'MM' : '') + ' \\u2014 WAITING')
+      : '\\u2713 PATH CLEAR';
     obEl.style.color = s.obstacle ? '#ff3b5c' : '#00ffa3';
 
     document.getElementById('manualBtn').style.display = s.manual_mode ? 'none' : 'block';
@@ -360,7 +459,9 @@ async function poll() {
   }
 }
 setInterval(poll, 1000);
+setInterval(pollScan, 300);
 poll();
+pollScan();
 </script>
 </body>
 </html>
@@ -407,10 +508,21 @@ class PhoneRequestHandler(http.server.BaseHTTPRequestHandler):
                 "running": d.is_running,
                 "auto_paused": d.auto_paused,
                 "obstacle": d.obstacle_active,
+                "obstacle_dist_mm": d.obstacle_dist_mm,
                 "manual_mode": d.manual_mode,
                 "alert": d.alert_active,
                 "alert_reason": d.alert_reason,
                 "stalled_seconds": None if stalled_secs is None else round(stalled_secs, 1),
+            })
+        elif path == "/api/scan":
+            with d.scan_lock:
+                points = [[a, dm, q] for a, (dm, q) in d.scan_points.items()
+                          if q >= MIN_QUALITY and dm > 0]
+            self._send_json({
+                "points": points,
+                "threshold_mm": d.obstacle_threshold_mm.get(),
+                "max_range_mm": MAP_MAX_RANGE_MM,
+                "front_half_angle": FRONT_HALF_ANGLE,
             })
         else:
             self.send_error(404)
@@ -490,6 +602,7 @@ class RobotDashboard:
         self.scan_points = {}          # {angle_deg_int: (distance_mm, quality)}
         self.scan_lock = threading.Lock()
         self.obstacle_active = False
+        self.obstacle_dist_mm = None
         self.auto_paused = False       # True if WE stopped the robot for an obstacle
         self.obstacle_threshold_mm = tk.IntVar(value=400)
         self.current_direction = None   # one of DIRECTION_STYLES keys, or None
@@ -1097,6 +1210,7 @@ class RobotDashboard:
         self._handle_obstacle_state(obstacle_found, obstacle_dist)
 
     def _handle_obstacle_state(self, obstacle_found, obstacle_dist):
+        self.obstacle_dist_mm = obstacle_dist
         if obstacle_found == self.obstacle_active:
             # no state change, but keep the label distance fresh
             if obstacle_found:

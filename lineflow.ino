@@ -23,6 +23,16 @@ int nudgeSpeed = 50;    // slow-side speed while correcting on the line
 bool running = false;
 int  selectedTable = 0;
 
+// ================= MANUAL DRIVE (phone/dashboard takeover) =================
+// manualMode -> true after a "MANUAL" command; the auto line-following loop
+//   is skipped entirely while this is set, and MFWD/MBACK/MLEFT/MRIGHT drive
+//   the motors directly. A "START" or "STOP" command always clears it.
+// lastManualCmdTime + MANUAL_TIMEOUT_MS is a dead-man's switch: if the phone
+//   loses the connection mid-drive, the motors auto-stop shortly after.
+bool manualMode = false;
+unsigned long lastManualCmdTime = 0;
+const unsigned long MANUAL_TIMEOUT_MS = 400;
+
 String inputBuffer = "";
 
 // ================= MOTOR FUNCTIONS (unchanged from original) =================
@@ -68,6 +78,15 @@ void stopBot() {
   analogWrite(PWM_RIGHT, 0);
 }
 
+// Mirrors forward()'s HIGH/HIGH = forward convention: LOW/LOW = reverse for
+// this driver. Untested on the real chassis yet - TUNE/verify direction.
+void reverseBot() {
+  digitalWrite(DIR_LEFT, LOW);
+  digitalWrite(DIR_RIGHT, LOW);
+  analogWrite(PWM_LEFT, speed);
+  analogWrite(PWM_RIGHT, speed);
+}
+
 // ================= INTERSECTION TURN =================
 // Reuses the same tested left()/right() motor patterns above, just held for
 // longer so the robot actually rotates onto the new corridor instead of only
@@ -104,6 +123,7 @@ void doIntersectionTurn(int direction) {
 // ================= SERIAL COMMAND HANDLING =================
 // Dashboard sends plain newline-terminated text commands:
 //   START, STOP, TABLE1, TABLE2
+//   MANUAL, MFWD, MBACK, MLEFT, MRIGHT, MSTOP  (phone/manual takeover)
 void processCommand(String cmd) {
   cmd.trim();
 
@@ -111,11 +131,13 @@ void processCommand(String cmd) {
     if (selectedTable == 0) {
       Serial.println("ERR:NO_TABLE_SELECTED");
     } else {
+      manualMode = false;
       running = true;
       Serial.println("OK:RUNNING");
     }
   } else if (cmd == "STOP") {
     running = false;
+    manualMode = false;
     stopBot();
     Serial.println("OK:STOPPED");
   } else if (cmd == "TABLE1") {
@@ -124,6 +146,25 @@ void processCommand(String cmd) {
   } else if (cmd == "TABLE2") {
     selectedTable = 2;
     Serial.println("OK:TABLE2_SELECTED");
+  } else if (cmd == "MANUAL") {
+    manualMode = true;
+    running = false;
+    stopBot();
+    lastManualCmdTime = millis();
+    Serial.println("OK:MANUAL_MODE");
+  } else if (cmd == "MFWD" || cmd == "MBACK" || cmd == "MLEFT" || cmd == "MRIGHT" || cmd == "MSTOP") {
+    if (!manualMode) {
+      Serial.println("ERR:NOT_MANUAL");
+    } else {
+      lastManualCmdTime = millis();
+      if (cmd == "MFWD") forward();
+      else if (cmd == "MBACK") reverseBot();
+      else if (cmd == "MLEFT") left();
+      else if (cmd == "MRIGHT") right();
+      else stopBot();  // MSTOP
+      Serial.print("OK:");
+      Serial.println(cmd);
+    }
   } else if (cmd.length() > 0) {
     Serial.print("ERR:UNKNOWN_CMD:");
     Serial.println(cmd);
@@ -164,6 +205,15 @@ void setup() {
 void loop() {
   // Always listen for dashboard commands, even while stopped.
   handleSerial();
+
+  if (manualMode) {
+    // Motors are driven directly by MFWD/MBACK/MLEFT/MRIGHT above; this is
+    // just the dead-man's switch in case the phone/dashboard goes quiet.
+    if (millis() - lastManualCmdTime > MANUAL_TIMEOUT_MS) {
+      stopBot();
+    }
+    return;
+  }
 
   if (!running) {
     stopBot();
@@ -226,5 +276,6 @@ void loop() {
   else {
     stopBot();
     Serial.println("LINE_LOST");
+    delay(50);  // avoid flooding serial while sitting lost
   }
 }

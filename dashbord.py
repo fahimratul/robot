@@ -69,6 +69,8 @@ MAP_MAX_RANGE_MM = 4000    # canvas display range (outer ring)
 FRONT_HALF_ANGLE = 90      # "front 180" = heading +/- 90 degrees
 
 PHONE_SERVER_PORT = 8765   # phone remote control - browse to http://<laptop-lan-ip>:8765
+STALL_ALERT_SECONDS = 10   # alert the phone if stopped this long (line lost or obstacle)
+MANUAL_COMMANDS = {"MFWD", "MBACK", "MLEFT", "MRIGHT", "MSTOP"}
 
 # =====================================================================
 # "HUD" theme - dark sci-fi palette used throughout the UI
@@ -224,22 +226,34 @@ PHONE_PAGE_HTML = """<!doctype html>
 <title>Robot Remote</title>
 <style>
   :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   body { background:#050810; color:#c9f4ff; font-family: Consolas, monospace; margin:0; padding:16px; }
   h1 { color:#00e5ff; font-size:1.1rem; text-align:center; margin:0 0 12px; }
   .status { text-align:center; margin-bottom:16px; font-size:0.95rem; color:#5b7a94; }
   .status b { color:#00e5ff; }
   .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
   button { padding:26px 8px; font-size:1.15rem; font-weight:bold; border-radius:10px;
-           border:1px solid #0a5f70; background:#101a2e; color:#00e5ff; }
+           border:1px solid #0a5f70; background:#101a2e; color:#00e5ff; touch-action:none; }
   button:active { background:#0a5f70; }
   button.start { color:#00ffa3; border-color:#00ffa3; }
   button.stop { color:#ff3b5c; border-color:#ff3b5c; }
   button.selected { background:#ff2ea6; color:#020508; }
   .obstacle { text-align:center; margin-top:16px; font-weight:bold; min-height:1.2em; }
+  .alertbar { display:none; text-align:center; font-weight:bold; padding:12px; border-radius:10px;
+              margin-bottom:14px; background:#3a0a14; color:#ff3b5c; border:1px solid #ff3b5c; }
+  body.alerting .alertbar { animation: flash 0.6s step-start infinite; }
+  @keyframes flash { 50% { background:#ff3b5c; color:#020508; } }
+  .manual-wrap { margin-top:20px; text-align:center; }
+  #manualBtn { width:100%; border-color:#ffb800; color:#ffb800; }
+  .dpad { display:none; grid-template-columns: 1fr 1fr 1fr; gap:8px; margin-top:14px; }
+  .dbtn { font-size:1.4rem; padding:20px 0; user-select:none; }
+  .dbtn.stopbtn { color:#ff3b5c; border-color:#ff3b5c; }
+  .hint { display:none; margin-top:10px; font-size:0.8rem; color:#5b7a94; }
 </style>
 </head>
 <body>
   <h1>&#9670; ROBOT REMOTE &#9670;</h1>
+  <div class="alertbar" id="alertbar"></div>
   <div class="status" id="status">connecting...</div>
   <div class="grid">
     <button id="t1" onclick="post('/api/table1')">TABLE 1<br>(LEFT)</button>
@@ -248,17 +262,74 @@ PHONE_PAGE_HTML = """<!doctype html>
     <button class="stop" onclick="post('/api/stop')">&#9632; STOP</button>
   </div>
   <div class="obstacle" id="obstacle"></div>
+
+  <div class="manual-wrap">
+    <button id="manualBtn" onclick="post('/api/manual/on')">&#9998; TAKE MANUAL CONTROL</button>
+    <div class="dpad" id="dpad">
+      <div></div><button class="dbtn" data-cmd="fwd">&#9650;</button><div></div>
+      <button class="dbtn" data-cmd="left">&#9664;</button>
+      <button class="dbtn stopbtn" data-cmd="stop">&#9632;</button>
+      <button class="dbtn" data-cmd="right">&#9654;</button>
+      <div></div><button class="dbtn" data-cmd="back">&#9660;</button><div></div>
+    </div>
+    <div class="hint" id="manualHint">Manual control active. Steer around the obstacle / back onto
+      the line, then press &#9654; START above to resume line-following.</div>
+  </div>
+
 <script>
 function post(path) {
   fetch(path, {method:'POST'}).catch(function(){});
 }
+
+let dpadInterval = null;
+function startMove(cmd) {
+  post('/api/manual/' + cmd);
+  if (dpadInterval) clearInterval(dpadInterval);
+  dpadInterval = setInterval(function(){ post('/api/manual/' + cmd); }, 150);
+}
+function stopMove() {
+  if (dpadInterval) { clearInterval(dpadInterval); dpadInterval = null; }
+  post('/api/manual/stop');
+}
+document.querySelectorAll('.dbtn').forEach(function(btn) {
+  const cmd = btn.dataset.cmd;
+  if (cmd === 'stop') {
+    btn.addEventListener('pointerdown', function(e) { e.preventDefault(); post('/api/manual/stop'); });
+    return;
+  }
+  btn.addEventListener('pointerdown', function(e) { e.preventDefault(); startMove(cmd); });
+  ['pointerup', 'pointerleave', 'pointercancel'].forEach(function(evt) {
+    btn.addEventListener(evt, stopMove);
+  });
+});
+
+let lastAlert = false;
+function beep() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.connect(g); g.connect(ctx.destination);
+    o.frequency.value = 880;
+    g.gain.value = 0.25;
+    o.start();
+    setTimeout(function(){ o.stop(); ctx.close(); }, 400);
+  } catch (e) {}
+}
+function triggerAlert() {
+  document.body.classList.add('alerting');
+  if (navigator.vibrate) navigator.vibrate([300, 150, 300, 150, 300]);
+  beep();
+}
+
 async function poll() {
   try {
     const r = await fetch('/api/status');
     const s = await r.json();
     const table = s.table ? ('TABLE ' + s.table) : 'NONE';
     let state = s.running ? 'RUNNING' : 'STOPPED';
-    if (s.auto_paused) state = 'WAITING (OBSTACLE)';
+    if (s.manual_mode) state = 'MANUAL CONTROL';
+    else if (s.auto_paused) state = 'WAITING (OBSTACLE)';
     document.getElementById('status').innerHTML =
       (s.connected ? '<b>CONNECTED</b>' : '<span style="color:#ff3b5c">DISCONNECTED</span>')
       + ' &nbsp; TABLE: <b>' + table + '</b> &nbsp; STATE: <b>' + state + '</b>';
@@ -267,6 +338,23 @@ async function poll() {
     const obEl = document.getElementById('obstacle');
     obEl.textContent = s.obstacle ? '\\u26A0 OBSTACLE DETECTED' : '';
     obEl.style.color = s.obstacle ? '#ff3b5c' : '#00ffa3';
+
+    document.getElementById('manualBtn').style.display = s.manual_mode ? 'none' : 'block';
+    document.getElementById('dpad').style.display = s.manual_mode ? 'grid' : 'none';
+    document.getElementById('manualHint').style.display = s.manual_mode ? 'block' : 'none';
+
+    const bar = document.getElementById('alertbar');
+    if (s.alert) {
+      const reason = s.alert_reason === 'line_lost' ? 'LOST THE LINE' : 'BLOCKED BY OBSTACLE';
+      const secs = s.stalled_seconds ? ' (' + Math.round(s.stalled_seconds) + 's)' : '';
+      bar.textContent = '\\u26A0 ROBOT NEEDS HELP \\u2014 ' + reason + secs;
+      bar.style.display = 'block';
+      if (!lastAlert) triggerAlert();
+    } else {
+      bar.style.display = 'none';
+      document.body.classList.remove('alerting');
+    }
+    lastAlert = s.alert;
   } catch (e) {
     document.getElementById('status').textContent = 'connection lost...';
   }
@@ -307,12 +395,22 @@ class PhoneRequestHandler(http.server.BaseHTTPRequestHandler):
         if path == "/":
             self._send_html(PHONE_PAGE_HTML)
         elif path == "/api/status":
+            now = time.time()
+            stalled_secs = None
+            if d.line_lost_since is not None:
+                stalled_secs = now - d.line_lost_since
+            elif d.obstacle_pause_since is not None:
+                stalled_secs = now - d.obstacle_pause_since
             self._send_json({
                 "connected": bool(d.ser and d.ser.is_open),
                 "table": d.selected_table,
                 "running": d.is_running,
                 "auto_paused": d.auto_paused,
                 "obstacle": d.obstacle_active,
+                "manual_mode": d.manual_mode,
+                "alert": d.alert_active,
+                "alert_reason": d.alert_reason,
+                "stalled_seconds": None if stalled_secs is None else round(stalled_secs, 1),
             })
         else:
             self.send_error(404)
@@ -325,6 +423,12 @@ class PhoneRequestHandler(http.server.BaseHTTPRequestHandler):
             "/api/table2": lambda: d._select_table(2),
             "/api/start": d._send_start,
             "/api/stop": d._send_stop,
+            "/api/manual/on": d._enter_manual,
+            "/api/manual/fwd": lambda: d._manual_move("MFWD"),
+            "/api/manual/back": lambda: d._manual_move("MBACK"),
+            "/api/manual/left": lambda: d._manual_move("MLEFT"),
+            "/api/manual/right": lambda: d._manual_move("MRIGHT"),
+            "/api/manual/stop": lambda: d._manual_move("MSTOP"),
         }
         action = actions.get(path)
         if action is None:
@@ -378,6 +482,8 @@ class RobotDashboard:
         self.reader_running = False
         self.selected_table = None
         self.is_running = False
+        self.manual_mode = False       # True after MANUAL takeover (phone or desktop)
+        self._manual_repeat_job = None  # after() handle for desktop press-and-hold
 
         # ---- LiDAR state ----
         self.lidar_worker = None
@@ -387,6 +493,12 @@ class RobotDashboard:
         self.auto_paused = False       # True if WE stopped the robot for an obstacle
         self.obstacle_threshold_mm = tk.IntVar(value=400)
         self.current_direction = None   # one of DIRECTION_STYLES keys, or None
+
+        # ---- Stall / alert tracking (line lost or blocked >10s -> alert phone) ----
+        self.line_lost_since = None
+        self.obstacle_pause_since = None
+        self.alert_active = False
+        self.alert_reason = None       # "line_lost" or "obstacle"
 
         self.speech = SpeechWorker(on_status=lambda msg: self.root.after(0, self._log, msg))
         if pyttsx3 is None:
@@ -529,7 +641,43 @@ class RobotDashboard:
 
         self.status_label = ttk.Label(left, text="TABLE: NONE  |  STATE: STOPPED",
                                        font=FONT_STATUS, foreground=ACCENT)
-        self.status_label.pack(fill="x", pady=(4, 8))
+        self.status_label.pack(fill="x", pady=(4, 4))
+
+        self.alert_label = ttk.Label(left, text="", font=FONT_STATUS, foreground=DANGER,
+                                      wraplength=260)
+        self.alert_label.pack(fill="x", pady=(0, 8))
+
+        manual_frame = ttk.LabelFrame(left, text="◆ MANUAL DRIVE (TAKEOVER, e.g. lost line/obstacle)")
+        manual_frame.pack(fill="x", pady=8)
+        self.manual_btn = self._neon_button(
+            manual_frame, text="✎ TAKE MANUAL CONTROL", width=28,
+            fg=WARNING, highlightbackground=WARNING, command=self._enter_manual)
+        self.manual_btn.grid(row=0, column=0, columnspan=3, padx=8, pady=(8, 4), sticky="ew")
+
+        self.mfwd_btn = self._neon_button(manual_frame, text="▲", width=5, state="disabled")
+        self.mfwd_btn.grid(row=1, column=1, padx=4, pady=2)
+        self.mfwd_btn.bind("<ButtonPress-1>", lambda e: self._manual_press("MFWD"))
+        self.mfwd_btn.bind("<ButtonRelease-1>", lambda e: self._manual_release())
+
+        self.mleft_btn = self._neon_button(manual_frame, text="◀", width=5, state="disabled")
+        self.mleft_btn.grid(row=2, column=0, padx=4, pady=2)
+        self.mleft_btn.bind("<ButtonPress-1>", lambda e: self._manual_press("MLEFT"))
+        self.mleft_btn.bind("<ButtonRelease-1>", lambda e: self._manual_release())
+
+        self.mstop_btn = self._neon_button(manual_frame, text="■", width=5, state="disabled",
+                                            fg=DANGER, highlightbackground=DANGER,
+                                            command=lambda: self._manual_move("MSTOP"))
+        self.mstop_btn.grid(row=2, column=1, padx=4, pady=2)
+
+        self.mright_btn = self._neon_button(manual_frame, text="▶", width=5, state="disabled")
+        self.mright_btn.grid(row=2, column=2, padx=4, pady=2)
+        self.mright_btn.bind("<ButtonPress-1>", lambda e: self._manual_press("MRIGHT"))
+        self.mright_btn.bind("<ButtonRelease-1>", lambda e: self._manual_release())
+
+        self.mback_btn = self._neon_button(manual_frame, text="▼", width=5, state="disabled")
+        self.mback_btn.grid(row=3, column=1, padx=4, pady=(2, 8))
+        self.mback_btn.bind("<ButtonPress-1>", lambda e: self._manual_press("MBACK"))
+        self.mback_btn.bind("<ButtonRelease-1>", lambda e: self._manual_release())
 
         log_frame = ttk.LabelFrame(left, text="◆ ROBOT LOG")
         log_frame.pack(fill="both", expand=True)
@@ -642,9 +790,19 @@ class RobotDashboard:
             try:
                 line = self.ser.readline().decode(errors="ignore").strip()
                 if line:
-                    self.root.after(0, self._log, f"Robot: {line}")
+                    self.root.after(0, self._on_robot_line, line)
             except Exception:
                 break
+
+    def _on_robot_line(self, line):
+        # Track how long the robot has been sitting lost, so we can alert
+        # the phone if it stays that way (see _check_stall_alert).
+        if line == "LINE_LOST":
+            if self.line_lost_since is None:
+                self.line_lost_since = time.time()
+        elif line in ("FORWARD", "LEFT", "RIGHT") or line.startswith("INTERSECTION"):
+            self.line_lost_since = None
+        self._log(f"Robot: {line}")
 
     def _select_table(self, table_num):
         if not (self.ser and self.ser.is_open):
@@ -664,12 +822,17 @@ class RobotDashboard:
         self._send("START")
         self.is_running = True
         self.auto_paused = False
+        self.manual_mode = False
+        self.line_lost_since = None
+        self.obstacle_pause_since = None
+        self._clear_alert()
         self._update_status()
 
     def _send_stop(self):
         self._send("STOP")
         self.is_running = False
         self.auto_paused = False
+        self.manual_mode = False
         self._update_status()
 
     def _send(self, cmd):
@@ -682,14 +845,84 @@ class RobotDashboard:
         else:
             self._log("Not connected.")
 
+    # ---------------- Manual drive takeover (phone or desktop) ----------------
+    def _enter_manual(self):
+        if not (self.ser and self.ser.is_open):
+            self._log("Connect to the robot first.")
+            return
+        self._send("MANUAL")
+        self.manual_mode = True
+        self.is_running = False
+        self.auto_paused = False
+        self.line_lost_since = None
+        self.obstacle_pause_since = None
+        self._clear_alert()
+        self._update_status()
+        for btn in (self.mfwd_btn, self.mback_btn, self.mleft_btn, self.mright_btn, self.mstop_btn):
+            btn.config(state="normal")
+
+    def _manual_move(self, cmd):
+        if not self.manual_mode:
+            self._log("Enable manual control first.")
+            return
+        self._send(cmd)
+
+    def _manual_press(self, cmd):
+        """Desktop press-and-hold: re-sends cmd every 150ms while held, mirroring
+        the phone joystick, well inside the firmware's 400ms dead-man's-switch."""
+        if not self.manual_mode:
+            return
+        self._send(cmd)
+        self._manual_repeat_job = self.root.after(150, lambda: self._manual_press(cmd))
+
+    def _manual_release(self):
+        if self._manual_repeat_job is not None:
+            self.root.after_cancel(self._manual_repeat_job)
+            self._manual_repeat_job = None
+        if self.manual_mode:
+            self._send("MSTOP")
+
     def _update_status(self):
         table_txt = "NONE" if self.selected_table is None else f"TABLE {self.selected_table}"
-        state_txt = "RUNNING" if self.is_running else "STOPPED"
-        color = SUCCESS if self.is_running else ACCENT
-        if self.auto_paused:
-            state_txt = "WAITING (OBSTACLE)"
-            color = WARNING
+        if self.manual_mode:
+            state_txt, color = "MANUAL CONTROL", ACCENT2
+        elif self.auto_paused:
+            state_txt, color = "WAITING (OBSTACLE)", WARNING
+        else:
+            state_txt = "RUNNING" if self.is_running else "STOPPED"
+            color = SUCCESS if self.is_running else ACCENT
         self.status_label.config(text=f"TABLE: {table_txt}  |  STATE: {state_txt}", foreground=color)
+        if not self.manual_mode:
+            for btn in (self.mfwd_btn, self.mback_btn, self.mleft_btn, self.mright_btn, self.mstop_btn):
+                btn.config(state="disabled")
+
+    # ---------------- Stall alert (line lost or obstacle-blocked >10s) ----------------
+    def _check_stall_alert(self):
+        now = time.time()
+        reason = None
+        if self.line_lost_since is not None and (now - self.line_lost_since) > STALL_ALERT_SECONDS:
+            reason = "line_lost"
+        elif self.obstacle_pause_since is not None and (now - self.obstacle_pause_since) > STALL_ALERT_SECONDS:
+            reason = "obstacle"
+
+        if reason and not self.alert_active:
+            self.alert_active = True
+            self.alert_reason = reason
+            desc = "lost the line" if reason == "line_lost" else "blocked by an obstacle"
+            self._log(f"⚠ ALERT: robot has been stalled ({desc}) for over "
+                      f"{STALL_ALERT_SECONDS}s — take manual control from your phone.")
+            self.speech.speak("Robot needs help, please take control")
+            tag = "LINE LOST" if reason == "line_lost" else "BLOCKED"
+            self.alert_label.config(text=f"⚠ NEEDS HELP: {tag} — USE PHONE/MANUAL", foreground=DANGER)
+        elif not reason and self.alert_active:
+            self._clear_alert()
+
+    def _clear_alert(self):
+        if self.alert_active:
+            self._log("Alert cleared.")
+        self.alert_active = False
+        self.alert_reason = None
+        self.alert_label.config(text="")
 
     def _detect_direction(self, msg):
         """Infer a heading from a log line (our own 'Sent: ...' commands, or
@@ -800,6 +1033,7 @@ class RobotDashboard:
     # ---------------- Map draw + obstacle check (runs on the Tk thread) ----------------
     def _refresh_map(self):
         self._draw_map_and_check_obstacle()
+        self._check_stall_alert()
         self.root.after(150, self._refresh_map)  # ~6-7 Hz refresh
 
     def _draw_map_and_check_obstacle(self):
@@ -879,6 +1113,7 @@ class RobotDashboard:
                 self._log(f"Obstacle detected at {obstacle_dist} mm in front 180 -> STOP")
                 self._send("STOP")
                 self.auto_paused = True
+                self.obstacle_pause_since = time.time()
                 self._update_status()
         else:
             self.obstacle_label.config(text="✓ PATH CLEAR", foreground=SUCCESS)
@@ -886,6 +1121,8 @@ class RobotDashboard:
                 self._log("Obstacle cleared -> resuming")
                 self._send("START")
                 self.auto_paused = False
+                self.obstacle_pause_since = None
+                self._clear_alert()
                 self._update_status()
 
 

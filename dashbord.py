@@ -366,9 +366,12 @@ class RobotDashboard:
     def __init__(self, root):
         self.root = root
         self.root.title("◈ ROBOT CONTROL SYSTEM — LIDAR HUD ◈")
-        self.root.geometry("1000x720")
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
         self.root.configure(bg=BG_MAIN)
+        try:
+            self.root.state("zoomed")  # start maximized (Windows/most Linux WMs)
+        except tk.TclError:
+            self.root.attributes("-zoomed", True)
 
         # ---- Robot serial state ----
         self.ser = None
@@ -467,7 +470,7 @@ class RobotDashboard:
 
     # ---------------- UI ----------------
     def _build_ui(self):
-        header = ttk.Label(self.root, text="◈ LINE FOLLOWER — ROBOT CONTROL & LIDAR HUD ◈",
+        header = ttk.Label(self.root, text="◈ MIST CAFE BOT ◈",
                             style="Header.TLabel", anchor="center")
         header.pack(fill="x", pady=(12, 0))
         sub = ttk.Label(self.root, text="TEENSY LINK · RPLIDAR C1 · REAL-TIME OBSTACLE FIELD",
@@ -574,10 +577,15 @@ class RobotDashboard:
 
         map_frame = ttk.LabelFrame(right, text="◆ LIDAR MAP — FRONT 180° OBSTACLE FIELD (SHADED)")
         map_frame.pack(fill="both", expand=True)
-        self.canvas_size = 560
+        self.canvas_size = 560  # updated live to match the map_frame's actual size
         self.canvas = tk.Canvas(map_frame, width=self.canvas_size, height=self.canvas_size,
                                  bg=BG_INSET, highlightthickness=1, highlightbackground=ACCENT_DIM)
-        self.canvas.pack(padx=8, pady=8)
+        self.canvas.pack(fill="both", expand=True, padx=8, pady=8)
+        self.canvas.bind("<Configure>", self._on_map_canvas_resize)
+
+    def _on_map_canvas_resize(self, event):
+        # Keep the radar circle square: use the smaller of width/height.
+        self.canvas_size = max(100, min(event.width, event.height))
 
     # ---------------- Port list ----------------
     def _refresh_ports(self):
@@ -797,9 +805,8 @@ class RobotDashboard:
     def _draw_map_and_check_obstacle(self):
         c = self.canvas
         c.delete("all")
-        size = self.canvas_size
-        cx, cy = size // 2, size // 2
-        max_r = size // 2 - 10
+        cx, cy = c.winfo_width() // 2, c.winfo_height() // 2
+        max_r = self.canvas_size // 2 - 10
         scale = max_r / MAP_MAX_RANGE_MM
 
         # Shade the front-180 sector (heading 0 = straight up on screen)

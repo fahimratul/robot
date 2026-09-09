@@ -1,0 +1,3 @@
+pyserial
+rplidarc1
+pyttsx3

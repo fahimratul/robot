@@ -16,6 +16,103 @@ int threshold = 2000;   // black threshold
 int speed      = 60;    // normal forward speed
 int nudgeSpeed = 50;    // slow-side speed while correcting on the line
 
+// ================= WHEEL ENCODERS / ODOMETRY =================
+#define ENC_LEFT_A  6
+#define ENC_LEFT_B  7
+#define ENC_RIGHT_A 8
+#define ENC_RIGHT_B 9
+
+// TUNE: set these from your encoder/gearbox datasheet and a physical
+// measurement of the chassis before trusting the odometry output.
+//   TICKS_PER_REV   = encoder counts per one WHEEL revolution (this code
+//                     counts one tick per rising edge of channel A, so this
+//                     is encoder-PPR * gearbox-ratio, NOT the raw encoder
+//                     datasheet PPR if there's a gearbox in between).
+//   WHEEL_DIAMETER_MM = outer diameter of the wheel touching the ground.
+//   WHEEL_TRACK_MM    = center-to-center distance between the two wheels.
+double TICKS_PER_REV     = 360.0;   // TUNE - placeholder
+double WHEEL_DIAMETER_MM = 120.0;    // TUNE - placeholder
+double WHEEL_TRACK_MM    = 310.0;   // TUNE - placeholder
+
+volatile long leftTicks  = 0;
+volatile long rightTicks = 0;
+
+// Robot pose estimate, in the frame where (0,0,0) = position/heading at
+// boot or at the last ODOM_RESET.
+double robotX_mm     = 0.0;
+double robotY_mm     = 0.0;
+double robotHeading  = 0.0;   // radians
+
+long lastLeftTicks  = 0;
+long lastRightTicks = 0;
+unsigned long lastOdomPrint = 0;
+const unsigned long ODOM_INTERVAL_MS = 100;
+
+// Reads channel B at the moment channel A rises to get direction.
+// NOT VERIFIED on real hardware yet - if forward driving reports negative
+// distance, swap the ISR's ++/-- (or swap the A/B wiring for that side).
+void leftEncoderISR() {
+  if (digitalRead(ENC_LEFT_B)) leftTicks++;
+  else leftTicks--;
+}
+void rightEncoderISR() {
+  if (digitalRead(ENC_RIGHT_B)) rightTicks--;
+  else rightTicks++;
+}
+
+void resetOdometry() {
+  noInterrupts();
+  leftTicks = 0;
+  rightTicks = 0;
+  interrupts();
+  lastLeftTicks = 0;
+  lastRightTicks = 0;
+  robotX_mm = 0.0;
+  robotY_mm = 0.0;
+  robotHeading = 0.0;
+}
+
+// Differential-drive dead-reckoning: called every loop() iteration
+// (independent of running/manualMode, so odometry never misses motion).
+// Prints ODOM:x_mm,y_mm,heading_deg on a fixed interval, not every call.
+void updateOdometry() {
+  long lt, rt;
+  noInterrupts();
+  lt = leftTicks;
+  rt = rightTicks;
+  interrupts();
+
+  long dLeftTicks  = lt - lastLeftTicks;
+  long dRightTicks = rt - lastRightTicks;
+  lastLeftTicks  = lt;
+  lastRightTicks = rt;
+
+  double mmPerTick = (PI * WHEEL_DIAMETER_MM) / TICKS_PER_REV;
+  double dLeft_mm  = dLeftTicks  * mmPerTick;
+  double dRight_mm = dRightTicks * mmPerTick;
+
+  double dCenter_mm = (dLeft_mm + dRight_mm) / 2.0;
+  double dTheta      = (dRight_mm - dLeft_mm) / WHEEL_TRACK_MM;
+
+  // Integrate using the heading at the midpoint of this step for better
+  // accuracy than a naive start-of-step heading.
+  double midHeading = robotHeading + dTheta / 2.0;
+  robotX_mm    += dCenter_mm * cos(midHeading);
+  robotY_mm    += dCenter_mm * sin(midHeading);
+  robotHeading += dTheta;
+
+  unsigned long now = millis();
+  if (now - lastOdomPrint >= ODOM_INTERVAL_MS) {
+    lastOdomPrint = now;
+    Serial.print("ODOM:");
+    Serial.print(robotX_mm, 1);
+    Serial.print(",");
+    Serial.print(robotY_mm, 1);
+    Serial.print(",");
+    Serial.println(robotHeading * 180.0 / PI, 1);
+  }
+}
+
 // ================= DASHBOARD-CONTROLLED STATE =================
 // running       -> becomes true only after a valid START command
 // selectedTable -> 0 = none, 1 = Table 1 (turn LEFT at intersection),
@@ -165,6 +262,35 @@ void processCommand(String cmd) {
       Serial.print("OK:");
       Serial.println(cmd);
     }
+  } else if (cmd == "ODOM_RESET") {
+    resetOdometry();
+    Serial.println("OK:ODOM_RESET");
+  } else if (cmd == "PINS") {
+    // Raw instantaneous digitalRead of all 4 encoder pins - bypasses the
+    // interrupt/tick logic entirely. Use this to check the wiring itself:
+    // send it repeatedly while slowly turning a wheel by hand and watch
+    // whether the values actually toggle between 0 and 1.
+    Serial.print("PINS:");
+    Serial.print(digitalRead(ENC_LEFT_A));
+    Serial.print(",");
+    Serial.print(digitalRead(ENC_LEFT_B));
+    Serial.print(",");
+    Serial.print(digitalRead(ENC_RIGHT_A));
+    Serial.print(",");
+    Serial.println(digitalRead(ENC_RIGHT_B));
+  } else if (cmd == "TICKS") {
+    // Raw tick counts, independent of TICKS_PER_REV/WHEEL_DIAMETER_MM - use
+    // this to CALIBRATE those constants: reset, rotate a wheel N full turns
+    // by hand, read this, divide by N to get that side's TICKS_PER_REV.
+    long lt, rt;
+    noInterrupts();
+    lt = leftTicks;
+    rt = rightTicks;
+    interrupts();
+    Serial.print("TICKS:");
+    Serial.print(lt);
+    Serial.print(",");
+    Serial.println(rt);
   } else if (cmd.length() > 0) {
     Serial.print("ERR:UNKNOWN_CMD:");
     Serial.println(cmd);
@@ -197,6 +323,16 @@ void setup() {
   pinMode(PWM_RIGHT, OUTPUT);
   pinMode(DIR_RIGHT, OUTPUT);
 
+  // INPUT_PULLUP is the safe default for open-collector encoder outputs;
+  // switch to plain INPUT if your encoder modules already drive push-pull
+  // (most Hall-effect quadrature boards with onboard pull-ups do).
+  pinMode(ENC_LEFT_A, INPUT_PULLUP);
+  pinMode(ENC_LEFT_B, INPUT_PULLUP);
+  pinMode(ENC_RIGHT_A, INPUT_PULLUP);
+  pinMode(ENC_RIGHT_B, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_LEFT_A), leftEncoderISR, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_RIGHT_A), rightEncoderISR, RISING);
+
   delay(1000);
   Serial.println("READY");
 }
@@ -205,6 +341,11 @@ void setup() {
 void loop() {
   // Always listen for dashboard commands, even while stopped.
   handleSerial();
+
+  // Odometry runs unconditionally so pose tracking never misses motion,
+  // whether it's autonomous line-following, manual takeover, or an
+  // eventual autonomous-nav drive command.
+  updateOdometry();
 
   if (manualMode) {
     // Motors are driven directly by MFWD/MBACK/MLEFT/MRIGHT above; this is
@@ -278,4 +419,4 @@ void loop() {
     Serial.println("LINE_LOST");
     delay(50);  // avoid flooding serial while sitting lost
   }
-}
+}      

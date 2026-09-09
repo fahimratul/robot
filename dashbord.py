@@ -88,11 +88,11 @@ SUCCESS = "#00ffa3"
 DANGER = "#ff3b5c"
 WARNING = "#ffb800"
 
-FONT_MONO = ("Consolas", 10)
-FONT_MONO_BOLD = ("Consolas", 10, "bold")
-FONT_HEADER = ("Consolas", 15, "bold")
-FONT_STATUS = ("Consolas", 10, "bold")
-FONT_BTN = ("Consolas", 10, "bold")
+FONT_MONO = ("Consolas", 9)
+FONT_MONO_BOLD = ("Consolas", 9, "bold")
+FONT_HEADER = ("Consolas", 12, "bold")
+FONT_STATUS = ("Consolas", 9, "bold")
+FONT_BTN = ("Consolas", 9, "bold")
 
 # direction key -> (glyph, color, label) - used to visualize robot heading
 DIRECTION_STYLES = {
@@ -584,10 +584,19 @@ class RobotDashboard:
         self.root.title("◈ ROBOT CONTROL SYSTEM — LIDAR HUD ◈")
         self.root.resizable(True, True)
         self.root.configure(bg=BG_MAIN)
-        try:
-            self.root.state("zoomed")  # start maximized (Windows/most Linux WMs)
-        except tk.TclError:
-            self.root.attributes("-zoomed", True)
+
+        # Fit the window to the actual screen exactly (works everywhere,
+        # including small kiosk displays with no/minimal window manager,
+        # where "zoomed"/"-zoomed" often silently does nothing).
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        self.compact = screen_w <= 1024 or screen_h <= 600  # e.g. 800x480 Pi panel
+        self.root.geometry(f"{screen_w}x{screen_h}+0+0")
+        if not self.compact:
+            try:
+                self.root.state("zoomed")
+            except tk.TclError:
+                pass
 
         # ---- Robot serial state ----
         self.ser = None
@@ -677,6 +686,13 @@ class RobotDashboard:
                          foreground=FG_TEXT, arrowcolor=ACCENT, bordercolor=ACCENT_DIM,
                          insertcolor=ACCENT)
 
+        style.configure("TNotebook", background=BG_MAIN, borderwidth=0)
+        style.configure("TNotebook.Tab", background=BG_PANEL_ALT, foreground=FG_DIM,
+                         font=FONT_BTN, padding=[10, 6], borderwidth=0)
+        style.map("TNotebook.Tab",
+                  background=[("selected", ACCENT_DIM)],
+                  foreground=[("selected", ACCENT)])
+
         # Make the dropdown listboxes match the dark theme too
         self.root.option_add("*TCombobox*Listbox.background", BG_PANEL_ALT)
         self.root.option_add("*TCombobox*Listbox.foreground", FG_TEXT)
@@ -697,152 +713,161 @@ class RobotDashboard:
     def _build_ui(self):
         header = ttk.Label(self.root, text="◈ MIST CAFE BOT ◈",
                             style="Header.TLabel", anchor="center")
-        header.pack(fill="x", pady=(12, 0))
-        sub = ttk.Label(self.root, text="TEENSY LINK · RPLIDAR C1 · REAL-TIME OBSTACLE FIELD",
-                         style="SubHeader.TLabel", anchor="center")
-        sub.pack(fill="x", pady=(0, 8))
+        header.pack(fill="x", pady=(4, 0))
+        if not self.compact:
+            sub = ttk.Label(self.root, text="TEENSY LINK · RPLIDAR C1 · REAL-TIME OBSTACLE FIELD",
+                             style="SubHeader.TLabel", anchor="center")
+            sub.pack(fill="x", pady=(0, 4))
 
-        body = ttk.Frame(self.root)
-        body.pack(fill="both", expand=True)
+        # Small screens (e.g. the 800x480 Pi panel) can't fit the control
+        # panel and the LiDAR map side by side, so each gets its own tab
+        # and can use the full window instead of half of it.
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill="both", expand=True, padx=4, pady=4)
+        self.notebook = notebook
 
-        left = ttk.Frame(body)
-        left.pack(side="left", fill="y", padx=10, pady=10)
+        control_tab = ttk.Frame(notebook)
+        lidar_tab = ttk.Frame(notebook)
+        log_tab = ttk.Frame(notebook)
+        notebook.add(control_tab, text="◆ CONTROL")
+        notebook.add(lidar_tab, text="◆ LIDAR MAP")
+        notebook.add(log_tab, text="◆ LOG")
 
-        right = ttk.Frame(body)
-        right.pack(side="left", fill="both", expand=True, padx=10, pady=10)
-
-        # ===== LEFT: Robot control =====
-        conn_frame = ttk.LabelFrame(left, text="◆ ROBOT LINK (TEENSY)")
-        conn_frame.pack(fill="x", pady=(0, 8))
+        # ===== TAB 1: Robot control =====
+        conn_frame = ttk.LabelFrame(control_tab, text="◆ ROBOT LINK (TEENSY)")
+        conn_frame.pack(fill="x", padx=6, pady=(3, 2))
 
         self.port_var = tk.StringVar()
         self.port_combo = ttk.Combobox(conn_frame, textvariable=self.port_var, width=16, state="readonly")
-        self.port_combo.grid(row=0, column=0, padx=6, pady=6)
+        self.port_combo.grid(row=0, column=0, padx=6, pady=2)
         ttk.Button(conn_frame, text="Refresh", command=self._refresh_ports).grid(row=0, column=1, padx=4)
         self.connect_btn = ttk.Button(conn_frame, text="Connect", command=self._toggle_connect)
-        self.connect_btn.grid(row=1, column=0, padx=6, pady=(0, 6))
+        self.connect_btn.grid(row=0, column=2, padx=6)
         self.conn_status = ttk.Label(conn_frame, text="● DISCONNECTED", foreground=DANGER,
                                       font=FONT_STATUS)
-        self.conn_status.grid(row=1, column=1, padx=6)
+        self.conn_status.grid(row=0, column=3, padx=6)
 
         self.phone_url_label = ttk.Label(conn_frame, text="Phone remote: starting...",
                                           font=("Consolas", 8), foreground=FG_DIM,
-                                          wraplength=220)
-        self.phone_url_label.grid(row=2, column=0, columnspan=2, padx=6, pady=(0, 6), sticky="w")
+                                          wraplength=760)
+        self.phone_url_label.grid(row=1, column=0, columnspan=4, padx=6, pady=(0, 2), sticky="w")
 
-        table_frame = ttk.LabelFrame(left, text="◆ SELECT TABLE (BEFORE START)")
-        table_frame.pack(fill="x", pady=8)
-        self.table1_btn = self._neon_button(table_frame, text="TABLE 1\n(turn LEFT)", width=14, height=3,
+        mid_row = ttk.Frame(control_tab)
+        mid_row.pack(fill="x", padx=6, pady=2)
+
+        table_frame = ttk.LabelFrame(mid_row, text="◆ SELECT TABLE")
+        table_frame.pack(side="left", fill="both", expand=True, padx=(0, 4))
+        self.table1_btn = self._neon_button(table_frame, text="TABLE 1\n(turn LEFT)", width=12, height=2,
                                              command=lambda: self._select_table(1))
-        self.table1_btn.grid(row=0, column=0, padx=8, pady=8)
-        self.table2_btn = self._neon_button(table_frame, text="TABLE 2\n(turn RIGHT)", width=14, height=3,
+        self.table1_btn.grid(row=0, column=0, padx=6, pady=3)
+        self.table2_btn = self._neon_button(table_frame, text="TABLE 2\n(turn RIGHT)", width=12, height=2,
                                              command=lambda: self._select_table(2))
-        self.table2_btn.grid(row=0, column=1, padx=8, pady=8)
+        self.table2_btn.grid(row=0, column=1, padx=6, pady=3)
 
-        control_frame = ttk.LabelFrame(left, text="◆ CONTROL")
-        control_frame.pack(fill="x", pady=8)
-        self.start_btn = self._neon_button(control_frame, text="▶ START", width=14, height=3,
+        control_frame = ttk.LabelFrame(mid_row, text="◆ CONTROL")
+        control_frame.pack(side="left", fill="both", expand=True, padx=(4, 0))
+        self.start_btn = self._neon_button(control_frame, text="▶ START", width=12, height=2,
                                             fg=SUCCESS, highlightbackground=SUCCESS,
                                             activebackground="#0a3324", state="disabled",
                                             command=self._send_start)
-        self.start_btn.grid(row=0, column=0, padx=8, pady=8)
-        self.stop_btn = self._neon_button(control_frame, text="■ STOP", width=14, height=3,
+        self.start_btn.grid(row=0, column=0, padx=6, pady=3)
+        self.stop_btn = self._neon_button(control_frame, text="■ STOP", width=12, height=2,
                                            fg=DANGER, highlightbackground=DANGER,
                                            activebackground="#3a0a14", state="disabled",
                                            command=self._send_stop)
-        self.stop_btn.grid(row=0, column=1, padx=8, pady=8)
+        self.stop_btn.grid(row=0, column=1, padx=6, pady=3)
 
-        self.status_label = ttk.Label(left, text="TABLE: NONE  |  STATE: STOPPED",
+        self.status_label = ttk.Label(control_tab, text="TABLE: NONE  |  STATE: STOPPED",
                                        font=FONT_STATUS, foreground=ACCENT)
-        self.status_label.pack(fill="x", pady=(4, 4))
+        self.status_label.pack(fill="x", padx=6, pady=(0, 1))
 
-        self.alert_label = ttk.Label(left, text="", font=FONT_STATUS, foreground=DANGER,
-                                      wraplength=260)
-        self.alert_label.pack(fill="x", pady=(0, 8))
+        self.alert_label = ttk.Label(control_tab, text="", font=FONT_STATUS, foreground=DANGER,
+                                      wraplength=760)
+        self.alert_label.pack(fill="x", padx=6, pady=(0, 2))
 
-        manual_frame = ttk.LabelFrame(left, text="◆ MANUAL DRIVE (TAKEOVER, e.g. lost line/obstacle)")
-        manual_frame.pack(fill="x", pady=8)
+        manual_frame = ttk.LabelFrame(control_tab, text="◆ MANUAL DRIVE (TAKEOVER)")
+        manual_frame.pack(fill="x", padx=6, pady=2)
         self.manual_btn = self._neon_button(
-            manual_frame, text="✎ TAKE MANUAL CONTROL", width=28,
+            manual_frame, text="✎ TAKE MANUAL CONTROL", width=24,
             fg=WARNING, highlightbackground=WARNING, command=self._enter_manual)
-        self.manual_btn.grid(row=0, column=0, columnspan=3, padx=8, pady=(8, 4), sticky="ew")
+        self.manual_btn.grid(row=0, column=0, rowspan=3, padx=(8, 16), pady=3, sticky="ns")
 
-        self.mfwd_btn = self._neon_button(manual_frame, text="▲", width=5, state="disabled")
-        self.mfwd_btn.grid(row=1, column=1, padx=4, pady=2)
+        self.mfwd_btn = self._neon_button(manual_frame, text="▲", width=4, state="disabled")
+        self.mfwd_btn.grid(row=0, column=2, padx=4, pady=1)
         self.mfwd_btn.bind("<ButtonPress-1>", lambda e: self._manual_press("MFWD"))
         self.mfwd_btn.bind("<ButtonRelease-1>", lambda e: self._manual_release())
 
-        self.mleft_btn = self._neon_button(manual_frame, text="◀", width=5, state="disabled")
-        self.mleft_btn.grid(row=2, column=0, padx=4, pady=2)
+        self.mleft_btn = self._neon_button(manual_frame, text="◀", width=4, state="disabled")
+        self.mleft_btn.grid(row=1, column=1, padx=4, pady=1)
         self.mleft_btn.bind("<ButtonPress-1>", lambda e: self._manual_press("MLEFT"))
         self.mleft_btn.bind("<ButtonRelease-1>", lambda e: self._manual_release())
 
-        self.mstop_btn = self._neon_button(manual_frame, text="■", width=5, state="disabled",
+        self.mstop_btn = self._neon_button(manual_frame, text="■", width=4, state="disabled",
                                             fg=DANGER, highlightbackground=DANGER,
                                             command=lambda: self._manual_move("MSTOP"))
-        self.mstop_btn.grid(row=2, column=1, padx=4, pady=2)
+        self.mstop_btn.grid(row=1, column=2, padx=4, pady=1)
 
-        self.mright_btn = self._neon_button(manual_frame, text="▶", width=5, state="disabled")
-        self.mright_btn.grid(row=2, column=2, padx=4, pady=2)
+        self.mright_btn = self._neon_button(manual_frame, text="▶", width=4, state="disabled")
+        self.mright_btn.grid(row=1, column=3, padx=4, pady=1)
         self.mright_btn.bind("<ButtonPress-1>", lambda e: self._manual_press("MRIGHT"))
         self.mright_btn.bind("<ButtonRelease-1>", lambda e: self._manual_release())
 
-        self.mback_btn = self._neon_button(manual_frame, text="▼", width=5, state="disabled")
-        self.mback_btn.grid(row=3, column=1, padx=4, pady=(2, 8))
+        self.mback_btn = self._neon_button(manual_frame, text="▼", width=4, state="disabled")
+        self.mback_btn.grid(row=2, column=2, padx=4, pady=(1, 3))
         self.mback_btn.bind("<ButtonPress-1>", lambda e: self._manual_press("MBACK"))
         self.mback_btn.bind("<ButtonRelease-1>", lambda e: self._manual_release())
 
-        log_frame = ttk.LabelFrame(left, text="◆ ROBOT LOG")
-        log_frame.pack(fill="both", expand=True)
-
-        dir_row = ttk.Frame(log_frame, style="Panel.TFrame")
-        dir_row.pack(fill="x", padx=4, pady=(6, 2))
-        self.dir_canvas = tk.Canvas(dir_row, width=50, height=50, bg=BG_INSET,
-                                     highlightthickness=1, highlightbackground=ACCENT_DIM)
-        self.dir_canvas.pack(side="left")
-        self.dir_label = ttk.Label(dir_row, text="—  IDLE", font=("Consolas", 12, "bold"),
-                                    foreground=FG_DIM, background=BG_PANEL)
-        self.dir_label.pack(side="left", padx=10)
-
-        self.log_text = tk.Text(log_frame, height=16, width=42, state="disabled", wrap="word",
-                                 bg=BG_INSET, fg=SUCCESS, insertbackground=ACCENT,
-                                 font=("Consolas", 9), relief="flat", highlightthickness=1,
-                                 highlightbackground=ACCENT_DIM, highlightcolor=ACCENT,
-                                 padx=6, pady=4)
-        self.log_text.pack(fill="both", expand=True, padx=4, pady=4)
-
-        # ===== RIGHT: LiDAR =====
-        lidar_conn_frame = ttk.LabelFrame(right, text="◆ LIDAR LINK (RPLIDAR C1)")
-        lidar_conn_frame.pack(fill="x")
+        # ===== TAB 2: LiDAR =====
+        lidar_conn_frame = ttk.LabelFrame(lidar_tab, text="◆ LIDAR LINK (RPLIDAR C1)")
+        lidar_conn_frame.pack(fill="x", padx=6, pady=(6, 4))
 
         self.lidar_port_var = tk.StringVar()
         self.lidar_port_combo = ttk.Combobox(lidar_conn_frame, textvariable=self.lidar_port_var,
-                                              width=16, state="readonly")
+                                              width=14, state="readonly")
         self.lidar_port_combo.grid(row=0, column=0, padx=6, pady=6)
         ttk.Button(lidar_conn_frame, text="Refresh", command=self._refresh_ports).grid(row=0, column=1, padx=4)
         self.lidar_connect_btn = ttk.Button(lidar_conn_frame, text="Connect LiDAR",
                                              command=self._toggle_lidar_connect)
         self.lidar_connect_btn.grid(row=0, column=2, padx=6)
 
-        ttk.Label(lidar_conn_frame, text="Obstacle distance (mm):").grid(row=0, column=3, padx=(16, 4))
+        ttk.Label(lidar_conn_frame, text="Obstacle (mm):").grid(row=0, column=3, padx=(12, 4))
         ttk.Spinbox(lidar_conn_frame, from_=100, to=4000, increment=50, width=6,
                     textvariable=self.obstacle_threshold_mm).grid(row=0, column=4, padx=4)
 
-        self.lidar_status_label = ttk.Label(right, text="● LIDAR: DISCONNECTED", foreground=DANGER,
+        status_row = ttk.Frame(lidar_tab)
+        status_row.pack(fill="x", padx=6)
+        self.lidar_status_label = ttk.Label(status_row, text="● LIDAR: DISCONNECTED", foreground=DANGER,
                                              font=FONT_STATUS, background=BG_MAIN)
-        self.lidar_status_label.pack(anchor="w", pady=(6, 0))
+        self.lidar_status_label.pack(side="left", pady=(2, 2))
 
-        self.obstacle_label = ttk.Label(right, text="✓ PATH CLEAR", foreground=SUCCESS,
-                                         font=("Consolas", 13, "bold"), background=BG_MAIN)
-        self.obstacle_label.pack(anchor="w", pady=(0, 6))
+        self.obstacle_label = ttk.Label(status_row, text="✓ PATH CLEAR", foreground=SUCCESS,
+                                         font=("Consolas", 11, "bold"), background=BG_MAIN)
+        self.obstacle_label.pack(side="right", pady=(2, 2))
 
-        map_frame = ttk.LabelFrame(right, text="◆ LIDAR MAP — FRONT 180° OBSTACLE FIELD (SHADED)")
-        map_frame.pack(fill="both", expand=True)
-        self.canvas_size = 560  # updated live to match the map_frame's actual size
+        map_frame = ttk.LabelFrame(lidar_tab, text="◆ MAP (FRONT 180° SHADED)")
+        map_frame.pack(fill="both", expand=True, padx=6, pady=4)
+        self.canvas_size = 400  # updated live to match the map_frame's actual size
         self.canvas = tk.Canvas(map_frame, width=self.canvas_size, height=self.canvas_size,
                                  bg=BG_INSET, highlightthickness=1, highlightbackground=ACCENT_DIM)
-        self.canvas.pack(fill="both", expand=True, padx=8, pady=8)
+        self.canvas.pack(fill="both", expand=True, padx=6, pady=6)
         self.canvas.bind("<Configure>", self._on_map_canvas_resize)
+
+        # ===== TAB 3: Log =====
+        dir_row = ttk.Frame(log_tab, style="Panel.TFrame")
+        dir_row.pack(fill="x", padx=6, pady=(6, 2))
+        self.dir_canvas = tk.Canvas(dir_row, width=44, height=44, bg=BG_INSET,
+                                     highlightthickness=1, highlightbackground=ACCENT_DIM)
+        self.dir_canvas.pack(side="left")
+        self.dir_label = ttk.Label(dir_row, text="—  IDLE", font=("Consolas", 11, "bold"),
+                                    foreground=FG_DIM, background=BG_PANEL)
+        self.dir_label.pack(side="left", padx=10)
+
+        self.log_text = tk.Text(log_tab, height=10, state="disabled", wrap="word",
+                                 bg=BG_INSET, fg=SUCCESS, insertbackground=ACCENT,
+                                 font=("Consolas", 9), relief="flat", highlightthickness=1,
+                                 highlightbackground=ACCENT_DIM, highlightcolor=ACCENT,
+                                 padx=6, pady=4)
+        self.log_text.pack(fill="both", expand=True, padx=6, pady=(2, 6))
 
     def _on_map_canvas_resize(self, event):
         # Keep the radar circle square: use the smaller of width/height.

@@ -258,6 +258,7 @@ PHONE_PAGE_HTML = """<!doctype html>
   button.start { color:#00ffa3; border-color:#00ffa3; }
   button.stop { color:#ff3b5c; border-color:#ff3b5c; }
   button.selected { background:#ff2ea6; color:#020508; }
+  #pathBtn { width:100%; margin-top:12px; color:#ff2ea6; border-color:#ff2ea6; }
   .obstacle { text-align:center; margin-top:16px; font-weight:bold; min-height:1.2em; }
   .radar-wrap { display:flex; justify-content:center; margin-top:10px; }
   #radar { background:#020508; border:1px solid #0a5f70; border-radius:8px; max-width:100%; }
@@ -285,6 +286,7 @@ PHONE_PAGE_HTML = """<!doctype html>
     <button class="start" onclick="post('/api/start')">&#9654; START</button>
     <button class="stop" onclick="post('/api/stop')">&#9632; STOP</button>
   </div>
+  <button id="pathBtn" onclick="post('/api/path/run')">&#9654; RUN PATH</button>
   <div class="obstacle" id="obstacle"></div>
 
   <div class="radar-wrap">
@@ -446,6 +448,7 @@ async function poll() {
     const table = s.table ? ('TABLE ' + s.table) : 'NONE';
     let state = s.running ? 'RUNNING' : 'STOPPED';
     if (s.manual_mode) state = 'MANUAL CONTROL';
+    else if (s.path_active) state = 'PATH RUNNING';
     else if (s.auto_paused) state = 'WAITING (OBSTACLE)';
     document.getElementById('status').innerHTML =
       (s.connected ? '<b>CONNECTED</b>' : '<span style="color:#ff3b5c">DISCONNECTED</span>')
@@ -530,6 +533,7 @@ class PhoneRequestHandler(http.server.BaseHTTPRequestHandler):
                 "obstacle": d.obstacle_active,
                 "obstacle_dist_mm": d.obstacle_dist_mm,
                 "manual_mode": d.manual_mode,
+                "path_active": d.path_active,
                 "alert": d.alert_active,
                 "alert_reason": d.alert_reason,
                 "stalled_seconds": None if stalled_secs is None else round(stalled_secs, 1),
@@ -555,6 +559,7 @@ class PhoneRequestHandler(http.server.BaseHTTPRequestHandler):
             "/api/table2": lambda: d._select_table(2),
             "/api/start": d._send_start,
             "/api/stop": d._send_stop,
+            "/api/path/run": d._run_path,
             "/api/manual/on": d._enter_manual,
             "/api/manual/fwd": lambda: d._manual_move("MFWD"),
             "/api/manual/back": lambda: d._manual_move("MBACK"),

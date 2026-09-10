@@ -113,6 +113,9 @@ def angle_in_front(angle_deg):
 # =====================================================================
 # LiDAR background worker (runs its own asyncio loop in a separate thread)
 # =====================================================================
+RECONNECT_DELAY_SECONDS = 3  # pause before retrying after the lidar lib crashes on a bad packet
+
+
 class LidarWorker:
     def __init__(self, port, on_point, on_status):
         self.port = port
@@ -120,17 +123,29 @@ class LidarWorker:
         self.on_status = on_status     # callback(str) - thread-safe logging
         self.lidar = None
         self.thread = None
-        self._stop_flag = threading.Event()
+        self._stop_flag = threading.Event()      # signals the current scan session to stop
+        self._stop_requested = threading.Event()  # user asked to disconnect - no more retries
 
     def start(self):
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     def _run(self):
-        try:
-            asyncio.run(self._main())
-        except Exception as e:
-            self.on_status(f"LiDAR worker ended: {e}")
+        # rplidarc1 occasionally raises IndexError deep inside its packet
+        # parser when a serial read comes back short/partial (common over
+        # USB-serial) - it doesn't recover on its own, so we tear down and
+        # reconnect instead of leaving the dashboard silently disconnected.
+        while not self._stop_requested.is_set():
+            self._stop_flag.clear()
+            try:
+                asyncio.run(self._main())
+            except Exception as e:
+                self.on_status(f"LiDAR worker ended: {e}")
+
+            if self._stop_requested.is_set():
+                break
+            self.on_status(f"LiDAR reconnecting in {RECONNECT_DELAY_SECONDS}s...")
+            self._stop_requested.wait(RECONNECT_DELAY_SECONDS)
 
     async def _main(self):
         if C1Lidar is None:
@@ -161,6 +176,7 @@ class LidarWorker:
             self.on_point(data["a_deg"], data["d_mm"], data["q"])
 
     def stop(self):
+        self._stop_requested.set()
         self._stop_flag.set()
         if self.lidar:
             try:

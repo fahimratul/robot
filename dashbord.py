@@ -72,6 +72,10 @@ PHONE_SERVER_PORT = 8765   # phone remote control - browse to http://<laptop-lan
 STALL_ALERT_SECONDS = 10   # alert the phone if stopped this long (line lost or obstacle)
 MANUAL_COMMANDS = {"MFWD", "MBACK", "MLEFT", "MRIGHT", "MSTOP"}
 
+# PATH tab step labels -> the action tokens lineflow.ino's PATH: command expects
+PATH_ACTION_TOKENS = {"FORWARD": "FWD", "BACK": "BACK", "LEFT": "LEFT",
+                       "RIGHT": "RIGHT", "HOLD": "HOLD"}
+
 # =====================================================================
 # "HUD" theme - dark sci-fi palette used throughout the UI
 # =====================================================================
@@ -621,6 +625,8 @@ class RobotDashboard:
         self.is_running = False
         self.manual_mode = False       # True after MANUAL takeover (phone or desktop)
         self._manual_repeat_job = None  # after() handle for desktop press-and-hold
+        self.path_active = False       # True while the Teensy is playing back a PATH
+        self.path_steps = []           # [(action_label, seconds), ...] built in the PATH tab
 
         # ---- LiDAR state ----
         self.lidar_worker = None
@@ -743,9 +749,11 @@ class RobotDashboard:
         self.notebook = notebook
 
         control_tab = ttk.Frame(notebook)
+        path_tab = ttk.Frame(notebook)
         lidar_tab = ttk.Frame(notebook)
         log_tab = ttk.Frame(notebook)
         notebook.add(control_tab, text="◆ CONTROL")
+        notebook.add(path_tab, text="◆ PATH")
         notebook.add(lidar_tab, text="◆ LIDAR MAP")
         notebook.add(log_tab, text="◆ LOG")
 
@@ -833,7 +841,47 @@ class RobotDashboard:
         self.mback_btn.bind("<ButtonPress-1>", lambda e: self._manual_press("MBACK"))
         self.mback_btn.bind("<ButtonRelease-1>", lambda e: self._manual_release())
 
-        # ===== TAB 2: LiDAR =====
+        # ===== TAB 2: Path (fake-autonomous scripted playback) =====
+        builder_frame = ttk.LabelFrame(path_tab, text="◆ ADD STEP")
+        builder_frame.pack(fill="x", padx=6, pady=(3, 1))
+
+        self.path_action_var = tk.StringVar(value="FORWARD")
+        ttk.Combobox(builder_frame, textvariable=self.path_action_var,
+                     values=["FORWARD", "BACK", "LEFT", "RIGHT", "HOLD"],
+                     state="readonly", width=10).grid(row=0, column=0, padx=6, pady=3)
+        ttk.Label(builder_frame, text="for").grid(row=0, column=1)
+        self.path_duration_var = tk.StringVar(value="3")
+        ttk.Spinbox(builder_frame, from_=0.5, to=120, increment=0.5, width=6,
+                    textvariable=self.path_duration_var).grid(row=0, column=2, padx=6)
+        ttk.Label(builder_frame, text="sec").grid(row=0, column=3)
+        ttk.Button(builder_frame, text="+ Add Step", command=self._add_path_step).grid(
+            row=0, column=4, padx=(16, 6))
+
+        # Packed with side="bottom" BEFORE the expanding list below, so this
+        # fixed-height row always claims its space first and never gets
+        # squeezed off-screen by the listbox's expand=True.
+        path_btn_row = ttk.Frame(path_tab)
+        path_btn_row.pack(side="bottom", fill="x", padx=6, pady=(1, 3))
+        ttk.Button(path_btn_row, text="Remove Selected", command=self._remove_path_step).pack(
+            side="left", padx=(0, 4))
+        ttk.Button(path_btn_row, text="Clear All", command=self._clear_path_steps).pack(
+            side="left", padx=4)
+        self._neon_button(path_btn_row, text="■ STOP", fg=DANGER, highlightbackground=DANGER,
+                           activebackground="#3a0a14", command=self._send_stop).pack(
+            side="right", padx=(4, 0))
+        self._neon_button(path_btn_row, text="▶ RUN PATH", fg=SUCCESS, highlightbackground=SUCCESS,
+                           activebackground="#0a3324", command=self._run_path).pack(
+            side="right", padx=4)
+
+        list_frame = ttk.LabelFrame(path_tab, text="◆ PATH STEPS")
+        list_frame.pack(fill="both", expand=True, padx=6, pady=1)
+        self.path_listbox = tk.Listbox(list_frame, height=3, bg=BG_INSET, fg=FG_TEXT,
+                                        selectbackground=ACCENT_DIM, selectforeground=ACCENT,
+                                        font=FONT_MONO, relief="flat", highlightthickness=1,
+                                        highlightbackground=ACCENT_DIM, highlightcolor=ACCENT)
+        self.path_listbox.pack(fill="both", expand=True, padx=6, pady=3)
+
+        # ===== TAB 3: LiDAR =====
         lidar_conn_frame = ttk.LabelFrame(lidar_tab, text="◆ LIDAR LINK (RPLIDAR C1)")
         lidar_conn_frame.pack(fill="x", padx=6, pady=(6, 4))
 
@@ -868,7 +916,7 @@ class RobotDashboard:
         self.canvas.pack(fill="both", expand=True, padx=6, pady=6)
         self.canvas.bind("<Configure>", self._on_map_canvas_resize)
 
-        # ===== TAB 3: Log =====
+        # ===== TAB 4: Log =====
         dir_row = ttk.Frame(log_tab, style="Panel.TFrame")
         dir_row.pack(fill="x", padx=6, pady=(6, 2))
         self.dir_canvas = tk.Canvas(dir_row, width=44, height=44, bg=BG_INSET,
@@ -956,6 +1004,14 @@ class RobotDashboard:
                 self.line_lost_since = time.time()
         elif line in ("FORWARD", "LEFT", "RIGHT") or line.startswith("INTERSECTION"):
             self.line_lost_since = None
+
+        if line.startswith("OK:PATH_STARTED"):
+            self.path_active = True
+            self._update_status()
+        elif line in ("PATH:DONE", "OK:PATH_STOPPED"):
+            self.path_active = False
+            self._update_status()
+
         self._log(f"Robot: {line}")
 
     def _select_table(self, table_num):
@@ -977,6 +1033,7 @@ class RobotDashboard:
         self.is_running = True
         self.auto_paused = False
         self.manual_mode = False
+        self.path_active = False
         self.line_lost_since = None
         self.obstacle_pause_since = None
         self._clear_alert()
@@ -987,6 +1044,7 @@ class RobotDashboard:
         self.is_running = False
         self.auto_paused = False
         self.manual_mode = False
+        self.path_active = False
         self._update_status()
 
     def _send(self, cmd):
@@ -1008,6 +1066,7 @@ class RobotDashboard:
         self.manual_mode = True
         self.is_running = False
         self.auto_paused = False
+        self.path_active = False
         self.line_lost_since = None
         self.obstacle_pause_since = None
         self._clear_alert()
@@ -1036,10 +1095,59 @@ class RobotDashboard:
         if self.manual_mode:
             self._send("MSTOP")
 
+    # ---------------- Path tab (fake-autonomous scripted playback) ----------------
+    def _add_path_step(self):
+        action = self.path_action_var.get()
+        try:
+            seconds = float(self.path_duration_var.get())
+        except ValueError:
+            self._log("Invalid step duration.")
+            return
+        if seconds <= 0:
+            self._log("Step duration must be greater than 0.")
+            return
+        self.path_steps.append((action, seconds))
+        self._refresh_path_listbox()
+
+    def _remove_path_step(self):
+        sel = self.path_listbox.curselection()
+        if not sel:
+            return
+        del self.path_steps[sel[0]]
+        self._refresh_path_listbox()
+
+    def _clear_path_steps(self):
+        self.path_steps.clear()
+        self._refresh_path_listbox()
+
+    def _refresh_path_listbox(self):
+        self.path_listbox.delete(0, "end")
+        for i, (action, seconds) in enumerate(self.path_steps, start=1):
+            self.path_listbox.insert("end", f"{i}. {action}  —  {seconds:g}s")
+
+    def _run_path(self):
+        if not (self.ser and self.ser.is_open):
+            self._log("Connect to the robot first.")
+            return
+        if not self.path_steps:
+            self._log("Path is empty - add at least one step first.")
+            return
+        body = ";".join(
+            f"{PATH_ACTION_TOKENS[action]},{int(round(seconds * 1000))}"
+            for action, seconds in self.path_steps
+        )
+        self.is_running = False
+        self.manual_mode = False
+        self.auto_paused = False
+        self._send(f"PATH:{body}")
+        self._update_status()
+
     def _update_status(self):
         table_txt = "NONE" if self.selected_table is None else f"TABLE {self.selected_table}"
         if self.manual_mode:
             state_txt, color = "MANUAL CONTROL", ACCENT2
+        elif self.path_active:
+            state_txt, color = "PATH RUNNING", ACCENT2
         elif self.auto_paused:
             state_txt, color = "WAITING (OBSTACLE)", WARNING
         else:

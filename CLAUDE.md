@@ -36,13 +36,16 @@ changes — don't let it drift from the code.
   array, intersection turn logic (`doIntersectionTurn`, direction chosen by
   `selectedTable`), manual-drive takeover with a 400ms dead-man's-switch
   (`MANUAL_TIMEOUT_MS`), plain-text serial command protocol.
-- `dashbord.py` — Laptop dashboard (Tkinter, "HUD" theme). Owns two serial
-  links (Teensy + RPLidar C1 directly), draws the live LiDAR radar/map,
-  auto-stops the robot when something enters the front-180° obstacle zone
-  and auto-resumes when clear, alerts (voice + phone vibration) if the robot
-  is stalled >10s, and runs a small HTTP server (port 8765) serving a phone
-  remote-control page (table select / start / stop / manual d-pad / live
-  radar) on the LAN.
+- `dashbord.py` — Robot-side dashboard (Tkinter, "HUD" theme; runs on the
+  Pi 5 + 7" touchscreen, tabbed CONTROL/PATH/LIDAR MAP/LOG layout sized to
+  fit small screens). Owns two serial links (Teensy + RPLidar C1 directly),
+  draws the live LiDAR radar/map, auto-stops the robot when something
+  enters the front-180° obstacle zone and auto-resumes when clear, alerts
+  (voice + phone vibration) if the robot is stalled >10s, lets the user
+  build/run a scripted timed-move sequence (PATH tab, see `PATH:` below),
+  and runs a small HTTP server (port 8765) serving a phone remote-control
+  page (table select / start / stop / manual d-pad / live radar) on the
+  LAN.
 
 ## Serial protocol (Teensy ⇄ laptop) — current
 
@@ -58,6 +61,27 @@ Plain text, newline-terminated, replies are `OK:...` / `ERR:...`:
 - `ODOM_RESET` — zero the encoder-based pose estimate (new, Phase 1)
 - Robot → laptop: `ODOM:x_mm,y_mm,heading_deg` every ~100ms, unconditional
   (new, Phase 1; not yet consumed by `dashbord.py`)
+- `PINS` — instantaneous digitalRead of all 4 encoder pins → `PINS:la,lb,ra,rb`
+  (wiring sanity check; Phase 1)
+- `TICKS` — raw encoder tick counts → `TICKS:left,right` (used to calibrate
+  `TICKS_PER_REV`; Phase 1)
+- `SENSORS` — raw QTR-8 readings → `SENSORS:v0,v1,...,v7`, independent of
+  `running` state (used to check the `threshold` constant against the real
+  track; added 2026-09-10, not tied to a phase)
+- `PATH:<steps>` — "fake-autonomous" scripted playback: run a fixed,
+  user-authored sequence of timed motion steps (e.g. forward 3s, then left
+  2s, then hold 5s...). `<steps>` is `ACTION,DURATION_MS` pairs separated by
+  `;` (ACTION one of `FWD`/`BACK`/`LEFT`/`RIGHT`/`HOLD`), built by the
+  dashboard's PATH tab from a step list the user adds to. Open-loop/timed,
+  not encoder closed-loop; mutually exclusive with line-following
+  (`running`) and manual takeover — `START`/`MANUAL`/`STOP` all cancel it.
+  Runs non-blocking out of `loop()` (`pathRunning`/`updatePath()`), so
+  `STOP` still takes effect immediately mid-path. Replies
+  `OK:PATH_STARTED:<n>`, then `PATH_STEP:<i>/<n>` per step, `PATH:DONE` at
+  the end, `ERR:PATH_EMPTY` if `<steps>` parsed to nothing. Added
+  2026-09-10, not tied to the SLAM roadmap below (this is a stopgap, not a
+  step toward it).
+- `PATH_STOP` — abort path playback early → `OK:PATH_STOPPED`
 
 ## Autonomous navigation feature — design decisions (2026-09-09)
 

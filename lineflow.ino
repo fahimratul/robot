@@ -1,5 +1,13 @@
 #include <QTRSensors.h>
 
+// Declared up here, before anything else, because the Arduino IDE
+// auto-generates function prototypes and inserts them right after the
+// #include block - if this enum were declared further down (where it's
+// used), those auto-generated prototypes would reference it before its
+// definition and fail to compile ("'PathAction' was not declared in this
+// scope"). See the FAKE-AUTONOMOUS PATH PLAYBACK section below for its use.
+enum PathAction { PATH_FWD, PATH_BACK, PATH_LEFT, PATH_RIGHT, PATH_HOLD };
+
 // ================= QTR SENSOR =================
 QTRSensors qtr;
 uint16_t sensorValues[8];
@@ -184,6 +192,125 @@ void reverseBot() {
   analogWrite(PWM_RIGHT, speed);
 }
 
+// ================= FAKE-AUTONOMOUS PATH PLAYBACK =================
+// A user-authored sequence of timed motion steps sent from the dashboard,
+// e.g. "forward 3s, then left 2s, then right 2s, then stop 5s, then back
+// onto the original heading" - open-loop/time-based (not encoder
+// closed-loop), for scripting a fixed route without full autonomous nav.
+// Runs non-blocking out of loop() so handleSerial() keeps being polled and
+// STOP/PATH_STOP take effect immediately instead of only after the whole
+// path finishes.
+#define PATH_MAX_STEPS 30
+// PathAction enum itself is declared at the very top of the file - see the
+// comment there for why.
+
+PathAction    pathActions[PATH_MAX_STEPS];
+unsigned long pathDurations[PATH_MAX_STEPS];  // ms
+int           pathStepCount = 0;
+int           pathStepIndex = -1;
+unsigned long pathStepStartTime = 0;
+bool          pathRunning = false;
+
+// Set by PATH_PAUSE (e.g. the dashboard pausing for a LiDAR obstacle) and
+// cleared by PATH_RESUME. Unlike PATH_STOP, this freezes progress in place
+// (current step + elapsed time within it) instead of cancelling the path,
+// so resuming continues the same step rather than restarting the path.
+bool          pathPaused = false;
+unsigned long pathPausedElapsedMs = 0;
+
+void applyPathAction(PathAction action) {
+  switch (action) {
+    case PATH_FWD:   forward();    break;
+    case PATH_BACK:  reverseBot(); break;
+    case PATH_LEFT:  left();       break;
+    case PATH_RIGHT: right();      break;
+    default:         stopBot();    break;  // PATH_HOLD - pause in place
+  }
+}
+
+void stopPath() {
+  pathRunning = false;
+  pathPaused = false;
+  pathStepIndex = -1;
+  stopBot();
+}
+
+void pausePath() {
+  if (!pathRunning || pathPaused) return;
+  pathPausedElapsedMs = millis() - pathStepStartTime;
+  pathPaused = true;
+  stopBot();
+}
+
+void resumePath() {
+  if (!pathRunning || !pathPaused) return;
+  pathStepStartTime = millis() - pathPausedElapsedMs;
+  applyPathAction(pathActions[pathStepIndex]);
+  pathPaused = false;
+}
+
+// body is everything after "PATH:", steps separated by ';', each step
+// "ACTION,DURATION_MS" e.g. "FWD,3000;LEFT,2000;RIGHT,2000;HOLD,5000".
+void startPath(String body) {
+  pathStepCount = 0;
+  int start = 0;
+  while (start < (int)body.length() && pathStepCount < PATH_MAX_STEPS) {
+    int sep = body.indexOf(';', start);
+    String token = (sep == -1) ? body.substring(start) : body.substring(start, sep);
+    token.trim();
+    int comma = token.indexOf(',');
+    if (comma != -1) {
+      String actionStr = token.substring(0, comma);
+      long durationMs = token.substring(comma + 1).toInt();
+      PathAction action;
+      if (actionStr == "FWD") action = PATH_FWD;
+      else if (actionStr == "BACK") action = PATH_BACK;
+      else if (actionStr == "LEFT") action = PATH_LEFT;
+      else if (actionStr == "RIGHT") action = PATH_RIGHT;
+      else action = PATH_HOLD;  // "HOLD" or anything unrecognized
+      pathActions[pathStepCount] = action;
+      pathDurations[pathStepCount] = (unsigned long)max(0L, durationMs);
+      pathStepCount++;
+    }
+    if (sep == -1) break;
+    start = sep + 1;
+  }
+
+  if (pathStepCount == 0) {
+    Serial.println("ERR:PATH_EMPTY");
+    return;
+  }
+
+  // Path mode is mutually exclusive with line-following and manual takeover.
+  running = false;
+  manualMode = false;
+  pathRunning = true;
+  pathStepIndex = 0;
+  pathStepStartTime = millis();
+  applyPathAction(pathActions[0]);
+  Serial.print("OK:PATH_STARTED:");
+  Serial.println(pathStepCount);
+}
+
+// Called every loop() iteration while pathRunning - advances to the next
+// step once the current one's duration has elapsed.
+void updatePath() {
+  if (millis() - pathStepStartTime < pathDurations[pathStepIndex]) return;
+
+  pathStepIndex++;
+  if (pathStepIndex >= pathStepCount) {
+    stopPath();
+    Serial.println("PATH:DONE");
+    return;
+  }
+  pathStepStartTime = millis();
+  applyPathAction(pathActions[pathStepIndex]);
+  Serial.print("PATH_STEP:");
+  Serial.print(pathStepIndex + 1);
+  Serial.print("/");
+  Serial.println(pathStepCount);
+}
+
 // ================= INTERSECTION TURN =================
 // Reuses the same tested left()/right() motor patterns above, just held for
 // longer so the robot actually rotates onto the new corridor instead of only
@@ -221,6 +348,8 @@ void doIntersectionTurn(int direction) {
 // Dashboard sends plain newline-terminated text commands:
 //   START, STOP, TABLE1, TABLE2
 //   MANUAL, MFWD, MBACK, MLEFT, MRIGHT, MSTOP  (phone/manual takeover)
+//   PATH:<steps>, PATH_STOP, PATH_PAUSE, PATH_RESUME  (scripted path playback)
+//   ODOM_RESET, PINS, TICKS, SENSORS  (encoder/sensor diagnostics)
 void processCommand(String cmd) {
   cmd.trim();
 
@@ -229,13 +358,14 @@ void processCommand(String cmd) {
       Serial.println("ERR:NO_TABLE_SELECTED");
     } else {
       manualMode = false;
+      stopPath();
       running = true;
       Serial.println("OK:RUNNING");
     }
   } else if (cmd == "STOP") {
     running = false;
     manualMode = false;
-    stopBot();
+    stopPath();  // also stops the motors
     Serial.println("OK:STOPPED");
   } else if (cmd == "TABLE1") {
     selectedTable = 1;
@@ -246,9 +376,32 @@ void processCommand(String cmd) {
   } else if (cmd == "MANUAL") {
     manualMode = true;
     running = false;
-    stopBot();
+    stopPath();  // also stops the motors
     lastManualCmdTime = millis();
     Serial.println("OK:MANUAL_MODE");
+  } else if (cmd.startsWith("PATH:")) {
+    startPath(cmd.substring(5));
+  } else if (cmd == "PATH_STOP") {
+    stopPath();
+    Serial.println("OK:PATH_STOPPED");
+  } else if (cmd == "PATH_PAUSE") {
+    if (!pathRunning) {
+      Serial.println("ERR:PATH_NOT_RUNNING");
+    } else if (pathPaused) {
+      Serial.println("ERR:PATH_ALREADY_PAUSED");
+    } else {
+      pausePath();
+      Serial.println("OK:PATH_PAUSED");
+    }
+  } else if (cmd == "PATH_RESUME") {
+    if (!pathRunning) {
+      Serial.println("ERR:PATH_NOT_RUNNING");
+    } else if (!pathPaused) {
+      Serial.println("ERR:PATH_NOT_PAUSED");
+    } else {
+      resumePath();
+      Serial.println("OK:PATH_RESUMED");
+    }
   } else if (cmd == "MFWD" || cmd == "MBACK" || cmd == "MLEFT" || cmd == "MRIGHT" || cmd == "MSTOP") {
     if (!manualMode) {
       Serial.println("ERR:NOT_MANUAL");
@@ -278,6 +431,21 @@ void processCommand(String cmd) {
     Serial.print(digitalRead(ENC_RIGHT_A));
     Serial.print(",");
     Serial.println(digitalRead(ENC_RIGHT_B));
+  } else if (cmd == "SENSORS") {
+    // Raw QTR readings, independent of running state - use this to check the
+    // `threshold` constant against your actual track's lighting/surface:
+    // hold the robot over plain track and over the black line and compare
+    // the printed values against `threshold` (2000). If white-background
+    // readings sit above threshold, or black-line readings sit below it,
+    // adjust `threshold` (or re-check sensor height/angle) before trusting
+    // line-following behavior.
+    qtr.read(sensorValues);
+    Serial.print("SENSORS:");
+    for (int i = 0; i < 8; i++) {
+      Serial.print(sensorValues[i]);
+      if (i < 7) Serial.print(",");
+    }
+    Serial.println();
   } else if (cmd == "TICKS") {
     // Raw tick counts, independent of TICKS_PER_REV/WHEEL_DIAMETER_MM - use
     // this to CALIBRATE those constants: reset, rotate a wheel N full turns
@@ -353,6 +521,11 @@ void loop() {
     if (millis() - lastManualCmdTime > MANUAL_TIMEOUT_MS) {
       stopBot();
     }
+    return;
+  }
+
+  if (pathRunning) {
+    if (!pathPaused) updatePath();  // paused: motors already off, hold position in the step sequence
     return;
   }
 

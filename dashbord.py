@@ -36,13 +36,14 @@ import asyncio
 import http.server
 import json
 import math
+import os
 import queue
 import socket
 import socketserver
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import simpledialog, ttk
 from urllib.parse import urlparse
 
 import serial
@@ -75,22 +76,39 @@ MANUAL_COMMANDS = {"MFWD", "MBACK", "MLEFT", "MRIGHT", "MSTOP"}
 # PATH tab step labels -> the action tokens lineflow.ino's PATH: command expects
 PATH_ACTION_TOKENS = {"FORWARD": "FWD", "BACK": "BACK", "LEFT": "LEFT",
                        "RIGHT": "RIGHT", "HOLD": "HOLD"}
+MANUAL_CMD_TO_PATH_ACTION = {"MFWD": "FORWARD", "MBACK": "BACK",
+                             "MLEFT": "LEFT", "MRIGHT": "RIGHT"}
+
+# Library of named PATH step-sequences, persisted next to this script so
+# they survive a dashboard restart.
+SAVED_PATHS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_paths.json")
+MIN_RECORDED_GAP_SECONDS = 0.3  # idle gaps shorter than this aren't recorded as a HOLD step
 
 # =====================================================================
-# "HUD" theme - dark sci-fi palette used throughout the UI
+# Light "classic" theme - standard light desktop-app palette used
+# throughout the Tkinter dashboard UI (the phone remote page below has
+# its own separate, unrelated dark theme).
 # =====================================================================
-BG_MAIN = "#050810"
-BG_PANEL = "#0b1220"
-BG_PANEL_ALT = "#101a2e"
-BG_INSET = "#020508"
-FG_TEXT = "#c9f4ff"
-FG_DIM = "#5b7a94"
-ACCENT = "#00e5ff"       # primary cyan
-ACCENT_DIM = "#0a5f70"
-ACCENT2 = "#ff2ea6"      # magenta highlight
-SUCCESS = "#00ffa3"
-DANGER = "#ff3b5c"
-WARNING = "#ffb800"
+BG_MAIN = "#f0f0f0"      # window background (classic light gray)
+BG_PANEL = "#ffffff"     # panel/frame background
+BG_PANEL_ALT = "#e6e6e6" # button faces / alternate panel background
+BG_INSET = "#ffffff"     # text/listbox/canvas insets
+FG_TEXT = "#1e1e1e"      # primary text
+FG_DIM = "#6e6e6e"       # secondary/dim text
+ACCENT = "#0058a3"       # primary blue
+ACCENT_DIM = "#a9c6e8"   # light blue - borders, dim highlights
+ACCENT2 = "#8e24aa"      # purple highlight (manual/turn indicators)
+SUCCESS = "#1e7d32"      # dark green
+DANGER = "#c62828"       # classic red
+WARNING = "#9a6d00"      # dark amber (readable on light backgrounds)
+
+# Very light tints used as button hover/active backgrounds, and subtle
+# fills on the LiDAR map canvas - kept separate from the palette above
+# since they're deliberately much lighter than any of those colors.
+SUCCESS_TINT = "#dff2e1"
+DANGER_TINT = "#fbdede"
+MAP_SECTOR_FILL = "#eaf2fb"
+MAP_SPOKE_COLOR = "#cfd8e3"
 
 FONT_MONO = ("Consolas", 9)
 FONT_MONO_BOLD = ("Consolas", 9, "bold")
@@ -633,6 +651,16 @@ class RobotDashboard:
         self.path_active = False       # True while the Teensy is playing back a PATH
         self.path_steps = []           # [(action_label, seconds), ...] built in the PATH tab
 
+        # ---- Record-by-driving (manual drive -> PATH steps) ----
+        self.recording = False
+        self._record_active_cmd = None   # currently-held MFWD/MBACK/MLEFT/MRIGHT, or None
+        self._record_start_time = None   # time.time() when _record_active_cmd started
+        self._record_idle_since = None   # time.time() since the last release, for HOLD gaps
+
+        # ---- Saved path library (persisted to SAVED_PATHS_FILE) ----
+        self.saved_paths = {}             # {name: [(action_label, seconds), ...]}
+        self._load_saved_paths()
+
         # ---- LiDAR state ----
         self.lidar_worker = None
         self.scan_points = {}          # {angle_deg_int: (distance_mm, quality)}
@@ -688,7 +716,7 @@ class RobotDashboard:
         style.configure("Panel.TFrame", background=BG_PANEL)
 
         style.configure("TLabelframe", background=BG_PANEL, bordercolor=ACCENT_DIM,
-                         borderwidth=1, relief="solid")
+                         borderwidth=2, relief="groove")
         style.configure("TLabelframe.Label", background=BG_PANEL, foreground=ACCENT,
                          font=FONT_MONO_BOLD)
 
@@ -697,41 +725,57 @@ class RobotDashboard:
         style.configure("SubHeader.TLabel", background=BG_MAIN, foreground=FG_DIM,
                          font=("Consolas", 9))
 
-        style.configure("TButton", background=BG_PANEL_ALT, foreground=ACCENT,
-                         font=FONT_BTN, borderwidth=1, focuscolor=BG_PANEL_ALT)
+        style.configure("TButton", background=BG_PANEL_ALT, foreground=FG_TEXT,
+                         font=FONT_BTN, borderwidth=2, relief="raised", focuscolor=BG_PANEL_ALT)
         style.map("TButton",
                   background=[("active", ACCENT_DIM), ("pressed", ACCENT_DIM)],
                   foreground=[("disabled", FG_DIM)])
 
-        style.configure("TCombobox", fieldbackground=BG_PANEL_ALT, background=BG_PANEL_ALT,
-                         foreground=FG_TEXT, arrowcolor=ACCENT, bordercolor=ACCENT_DIM,
-                         insertcolor=ACCENT)
-        style.map("TCombobox", fieldbackground=[("readonly", BG_PANEL_ALT)],
+        style.configure("TCombobox", fieldbackground=BG_PANEL, background=BG_PANEL_ALT,
+                         foreground=FG_TEXT, arrowcolor=FG_TEXT, bordercolor=ACCENT_DIM,
+                         insertcolor=FG_TEXT)
+        style.map("TCombobox", fieldbackground=[("readonly", BG_PANEL)],
                    foreground=[("readonly", FG_TEXT)])
 
-        style.configure("TSpinbox", fieldbackground=BG_PANEL_ALT, background=BG_PANEL_ALT,
-                         foreground=FG_TEXT, arrowcolor=ACCENT, bordercolor=ACCENT_DIM,
-                         insertcolor=ACCENT)
+        style.configure("TSpinbox", fieldbackground=BG_PANEL, background=BG_PANEL_ALT,
+                         foreground=FG_TEXT, arrowcolor=FG_TEXT, bordercolor=ACCENT_DIM,
+                         insertcolor=FG_TEXT)
 
         style.configure("TNotebook", background=BG_MAIN, borderwidth=0)
         style.configure("TNotebook.Tab", background=BG_PANEL_ALT, foreground=FG_DIM,
-                         font=FONT_BTN, padding=[10, 6], borderwidth=0)
+                         font=FONT_BTN, padding=[10, 6], borderwidth=1)
         style.map("TNotebook.Tab",
-                  background=[("selected", ACCENT_DIM)],
+                  background=[("selected", BG_PANEL)],
                   foreground=[("selected", ACCENT)])
 
-        # Make the dropdown listboxes match the dark theme too
-        self.root.option_add("*TCombobox*Listbox.background", BG_PANEL_ALT)
+        # Make the dropdown listboxes match the light theme too
+        self.root.option_add("*TCombobox*Listbox.background", BG_PANEL)
         self.root.option_add("*TCombobox*Listbox.foreground", FG_TEXT)
         self.root.option_add("*TCombobox*Listbox.selectBackground", ACCENT_DIM)
         self.root.option_add("*TCombobox*Listbox.font", FONT_MONO)
 
+        # Colored-text ttk.Button variants, used instead of _neon_button
+        # (raw tk.Button) in the PATH/SAVED tabs' bottom button rows: a
+        # tk.Button there reliably failed to ever paint on this Tk build
+        # (reported mapped/viewable with correct geometry, but nothing was
+        # drawn, even when forced to an unmissable debug color) - ttk.Button
+        # rendered correctly in every context tested, including these same
+        # tabs, so these styles sidestep the issue rather than chase it.
+        style.configure("Success.TButton", foreground=SUCCESS)
+        style.configure("Danger.TButton", foreground=DANGER)
+        style.configure("Accent.TButton", foreground=ACCENT)
+
     def _neon_button(self, parent, **kwargs):
+        # highlightthickness=0 is deliberately avoided here: on some Tk/Windows
+        # builds a packed tk.Button with zero highlight thickness fails to
+        # ever paint (reports mapped/viewable correctly, but nothing is drawn)
+        # - a long-standing Tk redraw/damage-region quirk. A minimal 1px
+        # thickness matching the background sidesteps it invisibly.
         defaults = dict(
-            font=FONT_BTN, bg=BG_PANEL_ALT, fg=ACCENT, activebackground=ACCENT_DIM,
-            activeforeground=ACCENT, disabledforeground=FG_DIM, relief="flat",
-            highlightthickness=1, highlightbackground=ACCENT_DIM, highlightcolor=ACCENT,
-            bd=0, cursor="hand2",
+            font=FONT_BTN, bg=BG_PANEL_ALT, fg=FG_TEXT, activebackground=ACCENT_DIM,
+            activeforeground=FG_TEXT, disabledforeground=FG_DIM, relief="raised",
+            highlightthickness=1, highlightbackground=BG_MAIN, highlightcolor=BG_MAIN,
+            bd=2, cursor="hand2",
         )
         defaults.update(kwargs)
         return tk.Button(parent, **defaults)
@@ -755,10 +799,12 @@ class RobotDashboard:
 
         control_tab = ttk.Frame(notebook)
         path_tab = ttk.Frame(notebook)
+        saved_tab = ttk.Frame(notebook)
         lidar_tab = ttk.Frame(notebook)
         log_tab = ttk.Frame(notebook)
         notebook.add(control_tab, text="◆ CONTROL")
         notebook.add(path_tab, text="◆ PATH")
+        notebook.add(saved_tab, text="◆ SAVED")
         notebook.add(lidar_tab, text="◆ LIDAR MAP")
         notebook.add(log_tab, text="◆ LOG")
 
@@ -796,14 +842,12 @@ class RobotDashboard:
         control_frame = ttk.LabelFrame(mid_row, text="◆ CONTROL")
         control_frame.pack(side="left", fill="both", expand=True, padx=(4, 0))
         self.start_btn = self._neon_button(control_frame, text="▶ START", width=12, height=2,
-                                            fg=SUCCESS, highlightbackground=SUCCESS,
-                                            activebackground="#0a3324", state="disabled",
-                                            command=self._send_start)
+                                            fg=SUCCESS, activebackground=SUCCESS_TINT,
+                                            state="disabled", command=self._send_start)
         self.start_btn.grid(row=0, column=0, padx=6, pady=3)
         self.stop_btn = self._neon_button(control_frame, text="■ STOP", width=12, height=2,
-                                           fg=DANGER, highlightbackground=DANGER,
-                                           activebackground="#3a0a14", state="disabled",
-                                           command=self._send_stop)
+                                           fg=DANGER, activebackground=DANGER_TINT,
+                                           state="disabled", command=self._send_stop)
         self.stop_btn.grid(row=0, column=1, padx=6, pady=3)
 
         self.status_label = ttk.Label(control_tab, text="TABLE: NONE  |  STATE: STOPPED",
@@ -818,7 +862,7 @@ class RobotDashboard:
         manual_frame.pack(fill="x", padx=6, pady=2)
         self.manual_btn = self._neon_button(
             manual_frame, text="✎ TAKE MANUAL CONTROL", width=24,
-            fg=WARNING, highlightbackground=WARNING, command=self._enter_manual)
+            fg=WARNING, command=self._enter_manual)
         self.manual_btn.grid(row=0, column=0, rowspan=3, padx=(8, 16), pady=3, sticky="ns")
 
         self.mfwd_btn = self._neon_button(manual_frame, text="▲", width=4, state="disabled")
@@ -832,8 +876,7 @@ class RobotDashboard:
         self.mleft_btn.bind("<ButtonRelease-1>", lambda e: self._manual_release())
 
         self.mstop_btn = self._neon_button(manual_frame, text="■", width=4, state="disabled",
-                                            fg=DANGER, highlightbackground=DANGER,
-                                            command=lambda: self._manual_move("MSTOP"))
+                                            fg=DANGER, command=lambda: self._manual_move("MSTOP"))
         self.mstop_btn.grid(row=1, column=2, padx=4, pady=1)
 
         self.mright_btn = self._neon_button(manual_frame, text="▶", width=4, state="disabled")
@@ -847,8 +890,18 @@ class RobotDashboard:
         self.mback_btn.bind("<ButtonRelease-1>", lambda e: self._manual_release())
 
         # ===== TAB 2: Path (fake-autonomous scripted playback) =====
+        # Uses grid for the tab's own top-level rows, and gives the step
+        # list a FIXED height (scrollbar for overflow) rather than
+        # expand=True: a Tcl/Tk quirk in some builds lets an expand=True
+        # Listbox visually render past its own reported geometry, painting
+        # over whatever sits below it even though the layout manager's own
+        # bookkeeping is correct. A fixed height sidesteps that outright.
+        # Row 3 is an empty spacer that absorbs any extra space instead.
+        path_tab.columnconfigure(0, weight=1)
+        path_tab.rowconfigure(3, weight=1)
+
         builder_frame = ttk.LabelFrame(path_tab, text="◆ ADD STEP")
-        builder_frame.pack(fill="x", padx=6, pady=(3, 1))
+        builder_frame.grid(row=0, column=0, sticky="ew", padx=6, pady=(3, 1))
 
         self.path_action_var = tk.StringVar(value="FORWARD")
         ttk.Combobox(builder_frame, textvariable=self.path_action_var,
@@ -861,32 +914,70 @@ class RobotDashboard:
         ttk.Label(builder_frame, text="sec").grid(row=0, column=3)
         ttk.Button(builder_frame, text="+ Add Step", command=self._add_path_step).grid(
             row=0, column=4, padx=(16, 6))
-
-        # Packed with side="bottom" BEFORE the expanding list below, so this
-        # fixed-height row always claims its space first and never gets
-        # squeezed off-screen by the listbox's expand=True.
-        path_btn_row = ttk.Frame(path_tab)
-        path_btn_row.pack(side="bottom", fill="x", padx=6, pady=(1, 3))
-        ttk.Button(path_btn_row, text="Remove Selected", command=self._remove_path_step).pack(
-            side="left", padx=(0, 4))
-        ttk.Button(path_btn_row, text="Clear All", command=self._clear_path_steps).pack(
-            side="left", padx=4)
-        self._neon_button(path_btn_row, text="■ STOP", fg=DANGER, highlightbackground=DANGER,
-                           activebackground="#3a0a14", command=self._send_stop).pack(
-            side="right", padx=(4, 0))
-        self._neon_button(path_btn_row, text="▶ RUN PATH", fg=SUCCESS, highlightbackground=SUCCESS,
-                           activebackground="#0a3324", command=self._run_path).pack(
-            side="right", padx=4)
+        self.record_btn = self._neon_button(
+            builder_frame, text="● Record", fg=WARNING, command=self._toggle_recording)
+        self.record_btn.grid(row=0, column=5, padx=(6, 6))
 
         list_frame = ttk.LabelFrame(path_tab, text="◆ PATH STEPS")
-        list_frame.pack(fill="both", expand=True, padx=6, pady=1)
-        self.path_listbox = tk.Listbox(list_frame, height=3, bg=BG_INSET, fg=FG_TEXT,
+        list_frame.grid(row=1, column=0, sticky="ew", padx=6, pady=1)
+        list_frame.columnconfigure(0, weight=1)
+        self.path_listbox = tk.Listbox(list_frame, height=6, bg=BG_INSET, fg=FG_TEXT,
                                         selectbackground=ACCENT_DIM, selectforeground=ACCENT,
                                         font=FONT_MONO, relief="flat", highlightthickness=1,
                                         highlightbackground=ACCENT_DIM, highlightcolor=ACCENT)
-        self.path_listbox.pack(fill="both", expand=True, padx=6, pady=3)
+        self.path_listbox.grid(row=0, column=0, sticky="ew", padx=(6, 0), pady=3)
+        path_scrollbar = ttk.Scrollbar(list_frame, orient="vertical",
+                                        command=self.path_listbox.yview)
+        path_scrollbar.grid(row=0, column=1, sticky="ns", padx=(0, 6), pady=3)
+        self.path_listbox.config(yscrollcommand=path_scrollbar.set)
 
-        # ===== TAB 3: LiDAR =====
+        # All buttons clustered together, left-aligned, in one narrow group
+        # (not split-justified across the row) - all ttk.Button, not
+        # _neon_button/tk.Button, see the Success/Danger/Accent.TButton
+        # styles above for why.
+        path_btn_row = ttk.Frame(path_tab)
+        path_btn_row.grid(row=2, column=0, sticky="w", padx=6, pady=(1, 1))
+        ttk.Button(path_btn_row, text="Remove", command=self._remove_path_step).grid(
+            row=0, column=0, padx=(0, 4))
+        ttk.Button(path_btn_row, text="Clear", command=self._clear_path_steps).grid(
+            row=0, column=1, padx=4)
+        ttk.Button(path_btn_row, text="▶ RUN", style="Success.TButton",
+                   command=self._run_path).grid(row=0, column=2, padx=4)
+        ttk.Button(path_btn_row, text="■ STOP", style="Danger.TButton",
+                   command=self._send_stop).grid(row=0, column=3, padx=(4, 0))
+
+        # ===== TAB 3: Saved path library =====
+        # Same fixed-height-listbox-plus-spacer reasoning as the PATH tab.
+        saved_tab.columnconfigure(0, weight=1)
+        saved_tab.rowconfigure(2, weight=1)
+
+        saved_list_frame = ttk.LabelFrame(saved_tab, text="◆ SAVED PATHS")
+        saved_list_frame.grid(row=0, column=0, sticky="ew", padx=6, pady=(4, 1))
+        saved_list_frame.columnconfigure(0, weight=1)
+        self.saved_listbox = tk.Listbox(saved_list_frame, height=6, bg=BG_INSET, fg=FG_TEXT,
+                                         selectbackground=ACCENT_DIM, selectforeground=ACCENT,
+                                         font=FONT_MONO, relief="flat", highlightthickness=1,
+                                         highlightbackground=ACCENT_DIM, highlightcolor=ACCENT)
+        self.saved_listbox.grid(row=0, column=0, sticky="ew", padx=(6, 0), pady=3)
+        saved_scrollbar = ttk.Scrollbar(saved_list_frame, orient="vertical",
+                                         command=self.saved_listbox.yview)
+        saved_scrollbar.grid(row=0, column=1, sticky="ns", padx=(0, 6), pady=3)
+        self.saved_listbox.config(yscrollcommand=saved_scrollbar.set)
+        self._refresh_saved_listbox()
+
+        # Clustered left-aligned, same reasoning as path_btn_row above.
+        saved_btn_row = ttk.Frame(saved_tab)
+        saved_btn_row.grid(row=1, column=0, sticky="w", padx=6, pady=(1, 1))
+        ttk.Button(saved_btn_row, text="Delete", command=self._delete_selected_saved_path).grid(
+            row=0, column=0, padx=(0, 4))
+        ttk.Button(saved_btn_row, text="Load",
+                   command=self._load_selected_saved_path).grid(row=0, column=1, padx=4)
+        ttk.Button(saved_btn_row, text="✎ Save As", style="Accent.TButton",
+                   command=self._save_current_path_as).grid(row=0, column=2, padx=4)
+        ttk.Button(saved_btn_row, text="▶ Run", style="Success.TButton",
+                   command=self._run_selected_saved_path).grid(row=0, column=3, padx=(4, 0))
+
+        # ===== TAB 4: LiDAR =====
         lidar_conn_frame = ttk.LabelFrame(lidar_tab, text="◆ LIDAR LINK (RPLIDAR C1)")
         lidar_conn_frame.pack(fill="x", padx=6, pady=(6, 4))
 
@@ -921,7 +1012,7 @@ class RobotDashboard:
         self.canvas.pack(fill="both", expand=True, padx=6, pady=6)
         self.canvas.bind("<Configure>", self._on_map_canvas_resize)
 
-        # ===== TAB 4: Log =====
+        # ===== TAB 5: Log =====
         dir_row = ttk.Frame(log_tab, style="Panel.TFrame")
         dir_row.pack(fill="x", padx=6, pady=(6, 2))
         self.dir_canvas = tk.Canvas(dir_row, width=44, height=44, bg=BG_INSET,
@@ -932,7 +1023,7 @@ class RobotDashboard:
         self.dir_label.pack(side="left", padx=10)
 
         self.log_text = tk.Text(log_tab, height=10, state="disabled", wrap="word",
-                                 bg=BG_INSET, fg=SUCCESS, insertbackground=ACCENT,
+                                 bg=BG_INSET, fg=FG_TEXT, insertbackground=ACCENT,
                                  font=("Consolas", 9), relief="flat", highlightthickness=1,
                                  highlightbackground=ACCENT_DIM, highlightcolor=ACCENT,
                                  padx=6, pady=4)
@@ -1034,6 +1125,7 @@ class RobotDashboard:
         self._update_status()
 
     def _send_start(self):
+        self._stop_recording()
         self._send("START")
         self.is_running = True
         self.auto_paused = False
@@ -1045,6 +1137,7 @@ class RobotDashboard:
         self._update_status()
 
     def _send_stop(self):
+        self._stop_recording()
         self._send("STOP")
         self.is_running = False
         self.auto_paused = False
@@ -1053,6 +1146,8 @@ class RobotDashboard:
         self._update_status()
 
     def _send(self, cmd):
+        if self.recording and cmd in MANUAL_COMMANDS:
+            self._record_manual_cmd(cmd)
         if self.ser and self.ser.is_open:
             try:
                 self.ser.write((cmd + "\n").encode())
@@ -1099,6 +1194,66 @@ class RobotDashboard:
             self._manual_repeat_job = None
         if self.manual_mode:
             self._send("MSTOP")
+
+    # ---------------- Record-by-driving (manual drive -> PATH steps) ----------------
+    def _toggle_recording(self):
+        if self.recording:
+            self._stop_recording()
+            return
+        if not self.manual_mode:
+            self._log("Take manual control first, then start recording.")
+            return
+        self.path_steps.clear()
+        self._refresh_path_listbox()
+        self.recording = True
+        self._record_active_cmd = None
+        self._record_start_time = None
+        self._record_idle_since = time.time()
+        self.record_btn.config(text="■ Stop & Save", fg=DANGER)
+        self._log("Recording started - drive the robot, then press Stop & Save.")
+
+    def _stop_recording(self):
+        if not self.recording:
+            return
+        self.recording = False
+        if self._record_active_cmd is not None:
+            self._finish_record_segment(time.time())
+        self._record_idle_since = None
+        self.record_btn.config(text="● Record", fg=WARNING)
+        self._log(f"Recording stopped - {len(self.path_steps)} step(s) captured. "
+                  f"Save it from the SAVED tab, or Run Path to try it now.")
+
+    def _record_manual_cmd(self, cmd):
+        now = time.time()
+        if cmd == "MSTOP":
+            if self._record_active_cmd is not None:
+                self._finish_record_segment(now)
+            self._record_idle_since = now
+            return
+
+        # A new direction: close out any idle gap since the last release as
+        # a HOLD step, and (if a different direction was already active
+        # with no MSTOP in between) close that segment out too.
+        if self._record_idle_since is not None:
+            gap = now - self._record_idle_since
+            if gap >= MIN_RECORDED_GAP_SECONDS:
+                self.path_steps.append(("HOLD", round(gap, 1)))
+                self._refresh_path_listbox()
+            self._record_idle_since = None
+        if self._record_active_cmd is not None and self._record_active_cmd != cmd:
+            self._finish_record_segment(now)
+        if self._record_active_cmd != cmd:
+            self._record_active_cmd = cmd
+            self._record_start_time = now
+
+    def _finish_record_segment(self, end_time):
+        duration = end_time - self._record_start_time
+        if duration >= 0.05:
+            action = MANUAL_CMD_TO_PATH_ACTION[self._record_active_cmd]
+            self.path_steps.append((action, round(duration, 1)))
+            self._refresh_path_listbox()
+        self._record_active_cmd = None
+        self._record_start_time = None
 
     # ---------------- Path tab (fake-autonomous scripted playback) ----------------
     def _add_path_step(self):
@@ -1147,14 +1302,91 @@ class RobotDashboard:
         self._send(f"PATH:{body}")
         self._update_status()
 
+    # ---------------- Saved path library ----------------
+    def _load_saved_paths(self):
+        try:
+            with open(SAVED_PATHS_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            self.saved_paths = {
+                name: [(action, seconds) for action, seconds in steps]
+                for name, steps in raw.items()
+            }
+        except FileNotFoundError:
+            self.saved_paths = {}
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            self.saved_paths = {}
+            self.root.after(0, self._log, f"Could not load {SAVED_PATHS_FILE}: {e}")
+
+    def _write_saved_paths(self):
+        try:
+            with open(SAVED_PATHS_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.saved_paths, f, indent=2)
+        except OSError as e:
+            self._log(f"Could not save path library: {e}")
+
+    def _refresh_saved_listbox(self):
+        self.saved_listbox.delete(0, "end")
+        for name in sorted(self.saved_paths):
+            steps = self.saved_paths[name]
+            total_s = sum(seconds for _action, seconds in steps)
+            self.saved_listbox.insert("end", f"{name}  ({len(steps)} steps, {total_s:g}s)")
+
+    def _selected_saved_name(self):
+        sel = self.saved_listbox.curselection()
+        if not sel:
+            self._log("Select a saved path first.")
+            return None
+        return sorted(self.saved_paths)[sel[0]]
+
+    def _save_current_path_as(self):
+        if not self.path_steps:
+            self._log("Nothing to save - add steps or record a drive first.")
+            return
+        name = simpledialog.askstring("Save Path", "Name this path:", parent=self.root)
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+        self.saved_paths[name] = list(self.path_steps)
+        self._write_saved_paths()
+        self._refresh_saved_listbox()
+        self._log(f"Saved path '{name}' ({len(self.path_steps)} steps).")
+
+    def _load_selected_saved_path(self):
+        name = self._selected_saved_name()
+        if name is None:
+            return
+        self.path_steps = list(self.saved_paths[name])
+        self._refresh_path_listbox()
+        self._log(f"Loaded '{name}' into the path editor.")
+
+    def _run_selected_saved_path(self):
+        name = self._selected_saved_name()
+        if name is None:
+            return
+        self.path_steps = list(self.saved_paths[name])
+        self._refresh_path_listbox()
+        self._log(f"Running saved path '{name}'.")
+        self._run_path()
+
+    def _delete_selected_saved_path(self):
+        name = self._selected_saved_name()
+        if name is None:
+            return
+        del self.saved_paths[name]
+        self._write_saved_paths()
+        self._refresh_saved_listbox()
+        self._log(f"Deleted saved path '{name}'.")
+
     def _update_status(self):
         table_txt = "NONE" if self.selected_table is None else f"TABLE {self.selected_table}"
         if self.manual_mode:
             state_txt, color = "MANUAL CONTROL", ACCENT2
-        elif self.path_active:
-            state_txt, color = "PATH RUNNING", ACCENT2
         elif self.auto_paused:
             state_txt, color = "WAITING (OBSTACLE)", WARNING
+        elif self.path_active:
+            state_txt, color = "PATH RUNNING", ACCENT2
         else:
             state_txt = "RUNNING" if self.is_running else "STOPPED"
             color = SUCCESS if self.is_running else ACCENT
@@ -1312,12 +1544,12 @@ class RobotDashboard:
 
         # Shade the front-180 sector (heading 0 = straight up on screen)
         c.create_arc(cx - max_r, cy - max_r, cx + max_r, cy + max_r,
-                     start=0, extent=180, fill="#0a1f2e", outline="", style="pieslice")
+                     start=0, extent=180, fill=MAP_SECTOR_FILL, outline="", style="pieslice")
         # Crosshair spokes
         for ang in (0, 45, 90, 135, 180, 225, 270, 315):
             theta = math.radians(ang - 90)
             c.create_line(cx, cy, cx + max_r * math.cos(theta), cy + max_r * math.sin(theta),
-                          fill="#0f2536")
+                          fill=MAP_SPOKE_COLOR)
         # Range rings (glow: faint outer + crisp inner)
         for frac in (0.25, 0.5, 0.75, 1.0):
             r = max_r * frac
@@ -1377,17 +1609,19 @@ class RobotDashboard:
             self.obstacle_label.config(text=f"⚠ OBSTACLE AT {obstacle_dist} MM — WAITING", foreground=DANGER)
             self._log(f"Voice: \"{OBSTACLE_VOICE_MSG}\"")
             self.speech.speak(OBSTACLE_VOICE_MSG)
-            if self.is_running and not self.auto_paused:
-                self._log(f"Obstacle detected at {obstacle_dist} mm in front 180 -> STOP")
-                self._send("STOP")
+            if (self.is_running or self.path_active) and not self.auto_paused:
+                pause_cmd = "PATH_PAUSE" if self.path_active else "STOP"
+                self._log(f"Obstacle detected at {obstacle_dist} mm in front 180 -> {pause_cmd}")
+                self._send(pause_cmd)
                 self.auto_paused = True
                 self.obstacle_pause_since = time.time()
                 self._update_status()
         else:
             self.obstacle_label.config(text="✓ PATH CLEAR", foreground=SUCCESS)
             if self.auto_paused:
-                self._log("Obstacle cleared -> resuming")
-                self._send("START")
+                resume_cmd = "PATH_RESUME" if self.path_active else "START"
+                self._log(f"Obstacle cleared -> {resume_cmd}")
+                self._send(resume_cmd)
                 self.auto_paused = False
                 self.obstacle_pause_since = None
                 self._clear_alert()

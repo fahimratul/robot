@@ -1,5 +1,13 @@
 #include <QTRSensors.h>
 
+// Declared up here, before anything else, because the Arduino IDE
+// auto-generates function prototypes and inserts them right after the
+// #include block - if this enum were declared further down (where it's
+// used), those auto-generated prototypes would reference it before its
+// definition and fail to compile ("'PathAction' was not declared in this
+// scope"). See the FAKE-AUTONOMOUS PATH PLAYBACK section below for its use.
+enum PathAction { PATH_FWD, PATH_BACK, PATH_LEFT, PATH_RIGHT, PATH_HOLD };
+
 // ================= QTR SENSOR =================
 QTRSensors qtr;
 uint16_t sensorValues[8];
@@ -193,7 +201,8 @@ void reverseBot() {
 // STOP/PATH_STOP take effect immediately instead of only after the whole
 // path finishes.
 #define PATH_MAX_STEPS 30
-enum PathAction { PATH_FWD, PATH_BACK, PATH_LEFT, PATH_RIGHT, PATH_HOLD };
+// PathAction enum itself is declared at the very top of the file - see the
+// comment there for why.
 
 PathAction    pathActions[PATH_MAX_STEPS];
 unsigned long pathDurations[PATH_MAX_STEPS];  // ms
@@ -201,6 +210,13 @@ int           pathStepCount = 0;
 int           pathStepIndex = -1;
 unsigned long pathStepStartTime = 0;
 bool          pathRunning = false;
+
+// Set by PATH_PAUSE (e.g. the dashboard pausing for a LiDAR obstacle) and
+// cleared by PATH_RESUME. Unlike PATH_STOP, this freezes progress in place
+// (current step + elapsed time within it) instead of cancelling the path,
+// so resuming continues the same step rather than restarting the path.
+bool          pathPaused = false;
+unsigned long pathPausedElapsedMs = 0;
 
 void applyPathAction(PathAction action) {
   switch (action) {
@@ -214,8 +230,23 @@ void applyPathAction(PathAction action) {
 
 void stopPath() {
   pathRunning = false;
+  pathPaused = false;
   pathStepIndex = -1;
   stopBot();
+}
+
+void pausePath() {
+  if (!pathRunning || pathPaused) return;
+  pathPausedElapsedMs = millis() - pathStepStartTime;
+  pathPaused = true;
+  stopBot();
+}
+
+void resumePath() {
+  if (!pathRunning || !pathPaused) return;
+  pathStepStartTime = millis() - pathPausedElapsedMs;
+  applyPathAction(pathActions[pathStepIndex]);
+  pathPaused = false;
 }
 
 // body is everything after "PATH:", steps separated by ';', each step
@@ -317,7 +348,7 @@ void doIntersectionTurn(int direction) {
 // Dashboard sends plain newline-terminated text commands:
 //   START, STOP, TABLE1, TABLE2
 //   MANUAL, MFWD, MBACK, MLEFT, MRIGHT, MSTOP  (phone/manual takeover)
-//   PATH:<steps>, PATH_STOP  (fake-autonomous scripted path playback)
+//   PATH:<steps>, PATH_STOP, PATH_PAUSE, PATH_RESUME  (scripted path playback)
 //   ODOM_RESET, PINS, TICKS, SENSORS  (encoder/sensor diagnostics)
 void processCommand(String cmd) {
   cmd.trim();
@@ -353,6 +384,24 @@ void processCommand(String cmd) {
   } else if (cmd == "PATH_STOP") {
     stopPath();
     Serial.println("OK:PATH_STOPPED");
+  } else if (cmd == "PATH_PAUSE") {
+    if (!pathRunning) {
+      Serial.println("ERR:PATH_NOT_RUNNING");
+    } else if (pathPaused) {
+      Serial.println("ERR:PATH_ALREADY_PAUSED");
+    } else {
+      pausePath();
+      Serial.println("OK:PATH_PAUSED");
+    }
+  } else if (cmd == "PATH_RESUME") {
+    if (!pathRunning) {
+      Serial.println("ERR:PATH_NOT_RUNNING");
+    } else if (!pathPaused) {
+      Serial.println("ERR:PATH_NOT_PAUSED");
+    } else {
+      resumePath();
+      Serial.println("OK:PATH_RESUMED");
+    }
   } else if (cmd == "MFWD" || cmd == "MBACK" || cmd == "MLEFT" || cmd == "MRIGHT" || cmd == "MSTOP") {
     if (!manualMode) {
       Serial.println("ERR:NOT_MANUAL");
@@ -476,7 +525,7 @@ void loop() {
   }
 
   if (pathRunning) {
-    updatePath();
+    if (!pathPaused) updatePath();  // paused: motors already off, hold position in the step sequence
     return;
   }
 

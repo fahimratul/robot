@@ -1,15 +1,21 @@
 """
-Line Follower Robot - Laptop Dashboard (with RPLidar C1 obstacle detection)
+Robot Dashboard - manual drive + scripted PATH playback (with RPLidar C1
+obstacle detection)
 ----------------------------------------------------------------------------
 Two independent serial links:
 
   1) Teensy (robot control) - plain text commands, newline terminated:
-        TABLE1   -> select Table 1 (robot turns LEFT at the next intersection)
-        TABLE2   -> select Table 2 (robot turns RIGHT at the next intersection)
-        START    -> begin running (only allowed after a table is selected)
-        STOP     -> stop immediately
-     The dashboard sends STOP/START itself (in addition to the buttons)
-     whenever the LiDAR sees/clears an obstacle in front of the robot.
+        MANUAL/MFWD/MBACK/MLEFT/MRIGHT/MSTOP -> manual takeover and drive
+        PATH:<steps> / PATH_STOP / PATH_PAUSE / PATH_RESUME -> scripted
+            timed-move playback (built or recorded in the PATH tab)
+        STOP     -> stop immediately, cancelling manual or path mode
+     The dashboard sends PATH_PAUSE/PATH_RESUME itself (in addition to the
+     buttons) whenever the LiDAR sees/clears an obstacle in front of the
+     robot while a path is running.
+
+     There is no closed-loop line-following or encoder odometry - the
+     robot's wheel encoders have a hardware fault that can't be replaced,
+     so all driving is either manual or open-loop scripted PATH playback.
 
   2) RPLidar C1 (obstacle detection + live map) - talked to directly from
      the laptop over its own USB serial port, using the 'rplidarc1' library.
@@ -242,7 +248,7 @@ class SpeechWorker:
 
 
 # =====================================================================
-# Phone remote control (LAN web page - select table / start / stop)
+# Phone remote control (LAN web page - stop / run path / manual d-pad)
 # =====================================================================
 def get_lan_ip():
     """Best-effort LAN IP of this machine (no packets actually sent)."""
@@ -269,13 +275,11 @@ PHONE_PAGE_HTML = """<!doctype html>
   h1 { color:#00e5ff; font-size:1.1rem; text-align:center; margin:0 0 12px; }
   .status { text-align:center; margin-bottom:16px; font-size:0.95rem; color:#5b7a94; }
   .status b { color:#00e5ff; }
-  .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
   button { padding:26px 8px; font-size:1.15rem; font-weight:bold; border-radius:10px;
            border:1px solid #0a5f70; background:#101a2e; color:#00e5ff; touch-action:none; }
   button:active { background:#0a5f70; }
-  button.start { color:#00ffa3; border-color:#00ffa3; }
   button.stop { color:#ff3b5c; border-color:#ff3b5c; }
-  button.selected { background:#ff2ea6; color:#020508; }
+  #stopBtn { width:100%; }
   #pathBtn { width:100%; margin-top:12px; color:#ff2ea6; border-color:#ff2ea6; }
   .obstacle { text-align:center; margin-top:16px; font-weight:bold; min-height:1.2em; }
   .radar-wrap { display:flex; justify-content:center; margin-top:10px; }
@@ -298,12 +302,7 @@ PHONE_PAGE_HTML = """<!doctype html>
   <h1>&#9670; ROBOT REMOTE &#9670;</h1>
   <div class="alertbar" id="alertbar"></div>
   <div class="status" id="status">connecting...</div>
-  <div class="grid">
-    <button id="t1" onclick="post('/api/table1')">TABLE 1<br>(LEFT)</button>
-    <button id="t2" onclick="post('/api/table2')">TABLE 2<br>(RIGHT)</button>
-    <button class="start" onclick="post('/api/start')">&#9654; START</button>
-    <button class="stop" onclick="post('/api/stop')">&#9632; STOP</button>
-  </div>
+  <button id="stopBtn" class="stop" onclick="post('/api/stop')">&#9632; STOP</button>
   <button id="pathBtn" onclick="post('/api/path/run')">&#9654; RUN PATH</button>
   <div class="obstacle" id="obstacle"></div>
 
@@ -325,8 +324,8 @@ PHONE_PAGE_HTML = """<!doctype html>
       <button class="dbtn" data-cmd="right">&#9654;</button>
       <div></div><button class="dbtn" data-cmd="back">&#9660;</button><div></div>
     </div>
-    <div class="hint" id="manualHint">Manual control active. Steer around the obstacle / back onto
-      the line, then press &#9654; START above to resume line-following.</div>
+    <div class="hint" id="manualHint">Manual control active. Steer the robot, then press
+      &#9632; STOP above to release manual control, or run a saved PATH.</div>
   </div>
 
 <script>
@@ -463,16 +462,13 @@ async function poll() {
   try {
     const r = await fetch('/api/status');
     const s = await r.json();
-    const table = s.table ? ('TABLE ' + s.table) : 'NONE';
-    let state = s.running ? 'RUNNING' : 'STOPPED';
+    let state = 'STOPPED';
     if (s.manual_mode) state = 'MANUAL CONTROL';
     else if (s.path_active) state = 'PATH RUNNING';
     else if (s.auto_paused) state = 'WAITING (OBSTACLE)';
     document.getElementById('status').innerHTML =
       (s.connected ? '<b>CONNECTED</b>' : '<span style="color:#ff3b5c">DISCONNECTED</span>')
-      + ' &nbsp; TABLE: <b>' + table + '</b> &nbsp; STATE: <b>' + state + '</b>';
-    document.getElementById('t1').className = s.table === 1 ? 'selected' : '';
-    document.getElementById('t2').className = s.table === 2 ? 'selected' : '';
+      + ' &nbsp; STATE: <b>' + state + '</b>';
     const obEl = document.getElementById('obstacle');
     obEl.textContent = s.obstacle
       ? ('\\u26A0 OBSTACLE' + (s.obstacle_dist_mm ? ' AT ' + s.obstacle_dist_mm + 'MM' : '') + ' \\u2014 WAITING')
@@ -485,9 +481,8 @@ async function poll() {
 
     const bar = document.getElementById('alertbar');
     if (s.alert) {
-      const reason = s.alert_reason === 'line_lost' ? 'LOST THE LINE' : 'BLOCKED BY OBSTACLE';
       const secs = s.stalled_seconds ? ' (' + Math.round(s.stalled_seconds) + 's)' : '';
-      bar.textContent = '\\u26A0 ROBOT NEEDS HELP \\u2014 ' + reason + secs;
+      bar.textContent = '\\u26A0 ROBOT NEEDS HELP \\u2014 BLOCKED BY OBSTACLE' + secs;
       bar.style.display = 'block';
       if (!lastAlert) triggerAlert();
     } else {
@@ -539,21 +534,16 @@ class PhoneRequestHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/status":
             now = time.time()
             stalled_secs = None
-            if d.line_lost_since is not None:
-                stalled_secs = now - d.line_lost_since
-            elif d.obstacle_pause_since is not None:
+            if d.obstacle_pause_since is not None:
                 stalled_secs = now - d.obstacle_pause_since
             self._send_json({
                 "connected": bool(d.ser and d.ser.is_open),
-                "table": d.selected_table,
-                "running": d.is_running,
                 "auto_paused": d.auto_paused,
                 "obstacle": d.obstacle_active,
                 "obstacle_dist_mm": d.obstacle_dist_mm,
                 "manual_mode": d.manual_mode,
                 "path_active": d.path_active,
                 "alert": d.alert_active,
-                "alert_reason": d.alert_reason,
                 "stalled_seconds": None if stalled_secs is None else round(stalled_secs, 1),
             })
         elif path == "/api/scan":
@@ -573,9 +563,6 @@ class PhoneRequestHandler(http.server.BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         d = self.dashboard
         actions = {
-            "/api/table1": lambda: d._select_table(1),
-            "/api/table2": lambda: d._select_table(2),
-            "/api/start": d._send_start,
             "/api/stop": d._send_stop,
             "/api/path/run": d._run_path,
             "/api/manual/on": d._enter_manual,
@@ -644,8 +631,6 @@ class RobotDashboard:
         # ---- Robot serial state ----
         self.ser = None
         self.reader_running = False
-        self.selected_table = None
-        self.is_running = False
         self.manual_mode = False       # True after MANUAL takeover (phone or desktop)
         self._manual_repeat_job = None  # after() handle for desktop press-and-hold
         self.path_active = False       # True while the Teensy is playing back a PATH
@@ -671,11 +656,9 @@ class RobotDashboard:
         self.obstacle_threshold_mm = tk.IntVar(value=400)
         self.current_direction = None   # one of DIRECTION_STYLES keys, or None
 
-        # ---- Stall / alert tracking (line lost or blocked >10s -> alert phone) ----
-        self.line_lost_since = None
+        # ---- Stall / alert tracking (blocked by an obstacle >10s -> alert phone) ----
         self.obstacle_pause_since = None
         self.alert_active = False
-        self.alert_reason = None       # "line_lost" or "obstacle"
 
         self.speech = SpeechWorker(on_status=lambda msg: self.root.after(0, self._log, msg))
         if pyttsx3 is None:
@@ -827,30 +810,14 @@ class RobotDashboard:
                                           wraplength=760)
         self.phone_url_label.grid(row=1, column=0, columnspan=4, padx=6, pady=(0, 2), sticky="w")
 
-        mid_row = ttk.Frame(control_tab)
-        mid_row.pack(fill="x", padx=6, pady=2)
-
-        table_frame = ttk.LabelFrame(mid_row, text="◆ SELECT TABLE")
-        table_frame.pack(side="left", fill="both", expand=True, padx=(0, 4))
-        self.table1_btn = self._neon_button(table_frame, text="TABLE 1\n(turn LEFT)", width=12, height=2,
-                                             command=lambda: self._select_table(1))
-        self.table1_btn.grid(row=0, column=0, padx=6, pady=3)
-        self.table2_btn = self._neon_button(table_frame, text="TABLE 2\n(turn RIGHT)", width=12, height=2,
-                                             command=lambda: self._select_table(2))
-        self.table2_btn.grid(row=0, column=1, padx=6, pady=3)
-
-        control_frame = ttk.LabelFrame(mid_row, text="◆ CONTROL")
-        control_frame.pack(side="left", fill="both", expand=True, padx=(4, 0))
-        self.start_btn = self._neon_button(control_frame, text="▶ START", width=12, height=2,
-                                            fg=SUCCESS, activebackground=SUCCESS_TINT,
-                                            state="disabled", command=self._send_start)
-        self.start_btn.grid(row=0, column=0, padx=6, pady=3)
-        self.stop_btn = self._neon_button(control_frame, text="■ STOP", width=12, height=2,
+        control_frame = ttk.LabelFrame(control_tab, text="◆ CONTROL")
+        control_frame.pack(fill="x", padx=6, pady=2)
+        self.stop_btn = self._neon_button(control_frame, text="■ STOP", width=16, height=2,
                                            fg=DANGER, activebackground=DANGER_TINT,
                                            state="disabled", command=self._send_stop)
-        self.stop_btn.grid(row=0, column=1, padx=6, pady=3)
+        self.stop_btn.pack(padx=6, pady=6)
 
-        self.status_label = ttk.Label(control_tab, text="TABLE: NONE  |  STATE: STOPPED",
+        self.status_label = ttk.Label(control_tab, text="STATE: STOPPED",
                                        font=FONT_STATUS, foreground=ACCENT)
         self.status_label.pack(fill="x", padx=6, pady=(0, 1))
 
@@ -1079,7 +1046,6 @@ class RobotDashboard:
         self.ser = None
         self.conn_status.config(text="● DISCONNECTED", foreground=DANGER)
         self.connect_btn.config(text="Connect")
-        self.start_btn.config(state="disabled")
         self.stop_btn.config(state="disabled")
         self._log("Disconnected from robot.")
 
@@ -1093,14 +1059,6 @@ class RobotDashboard:
                 break
 
     def _on_robot_line(self, line):
-        # Track how long the robot has been sitting lost, so we can alert
-        # the phone if it stays that way (see _check_stall_alert).
-        if line == "LINE_LOST":
-            if self.line_lost_since is None:
-                self.line_lost_since = time.time()
-        elif line in ("FORWARD", "LEFT", "RIGHT") or line.startswith("INTERSECTION"):
-            self.line_lost_since = None
-
         if line.startswith("OK:PATH_STARTED"):
             self.path_active = True
             self._update_status()
@@ -1110,36 +1068,9 @@ class RobotDashboard:
 
         self._log(f"Robot: {line}")
 
-    def _select_table(self, table_num):
-        if not (self.ser and self.ser.is_open):
-            self._log("Connect to the robot first.")
-            return
-        self.selected_table = table_num
-        self._send("TABLE1" if table_num == 1 else "TABLE2")
-
-        self.table1_btn.config(bg=ACCENT2 if table_num == 1 else BG_PANEL_ALT,
-                                fg=BG_INSET if table_num == 1 else ACCENT)
-        self.table2_btn.config(bg=ACCENT2 if table_num == 2 else BG_PANEL_ALT,
-                                fg=BG_INSET if table_num == 2 else ACCENT)
-        self.start_btn.config(state="normal")
-        self._update_status()
-
-    def _send_start(self):
-        self._stop_recording()
-        self._send("START")
-        self.is_running = True
-        self.auto_paused = False
-        self.manual_mode = False
-        self.path_active = False
-        self.line_lost_since = None
-        self.obstacle_pause_since = None
-        self._clear_alert()
-        self._update_status()
-
     def _send_stop(self):
         self._stop_recording()
         self._send("STOP")
-        self.is_running = False
         self.auto_paused = False
         self.manual_mode = False
         self.path_active = False
@@ -1164,10 +1095,8 @@ class RobotDashboard:
             return
         self._send("MANUAL")
         self.manual_mode = True
-        self.is_running = False
         self.auto_paused = False
         self.path_active = False
-        self.line_lost_since = None
         self.obstacle_pause_since = None
         self._clear_alert()
         self._update_status()
@@ -1296,7 +1225,6 @@ class RobotDashboard:
             f"{PATH_ACTION_TOKENS[action]},{int(round(seconds * 1000))}"
             for action, seconds in self.path_steps
         )
-        self.is_running = False
         self.manual_mode = False
         self.auto_paused = False
         self._send(f"PATH:{body}")
@@ -1380,7 +1308,6 @@ class RobotDashboard:
         self._log(f"Deleted saved path '{name}'.")
 
     def _update_status(self):
-        table_txt = "NONE" if self.selected_table is None else f"TABLE {self.selected_table}"
         if self.manual_mode:
             state_txt, color = "MANUAL CONTROL", ACCENT2
         elif self.auto_paused:
@@ -1388,54 +1315,46 @@ class RobotDashboard:
         elif self.path_active:
             state_txt, color = "PATH RUNNING", ACCENT2
         else:
-            state_txt = "RUNNING" if self.is_running else "STOPPED"
-            color = SUCCESS if self.is_running else ACCENT
-        self.status_label.config(text=f"TABLE: {table_txt}  |  STATE: {state_txt}", foreground=color)
+            state_txt, color = "STOPPED", ACCENT
+        self.status_label.config(text=f"STATE: {state_txt}", foreground=color)
         if not self.manual_mode:
             for btn in (self.mfwd_btn, self.mback_btn, self.mleft_btn, self.mright_btn, self.mstop_btn):
                 btn.config(state="disabled")
 
-    # ---------------- Stall alert (line lost or obstacle-blocked >10s) ----------------
+    # ---------------- Stall alert (obstacle-blocked >10s) ----------------
     def _check_stall_alert(self):
         now = time.time()
-        reason = None
-        if self.line_lost_since is not None and (now - self.line_lost_since) > STALL_ALERT_SECONDS:
-            reason = "line_lost"
-        elif self.obstacle_pause_since is not None and (now - self.obstacle_pause_since) > STALL_ALERT_SECONDS:
-            reason = "obstacle"
+        stalled = (self.obstacle_pause_since is not None
+                   and (now - self.obstacle_pause_since) > STALL_ALERT_SECONDS)
 
-        if reason and not self.alert_active:
+        if stalled and not self.alert_active:
             self.alert_active = True
-            self.alert_reason = reason
-            desc = "lost the line" if reason == "line_lost" else "blocked by an obstacle"
-            self._log(f"⚠ ALERT: robot has been stalled ({desc}) for over "
+            self._log(f"⚠ ALERT: robot has been blocked by an obstacle for over "
                       f"{STALL_ALERT_SECONDS}s — take manual control from your phone.")
             self.speech.speak("Robot needs help, please take control")
-            tag = "LINE LOST" if reason == "line_lost" else "BLOCKED"
-            self.alert_label.config(text=f"⚠ NEEDS HELP: {tag} — USE PHONE/MANUAL", foreground=DANGER)
-        elif not reason and self.alert_active:
+            self.alert_label.config(text="⚠ NEEDS HELP: BLOCKED — USE PHONE/MANUAL", foreground=DANGER)
+        elif not stalled and self.alert_active:
             self._clear_alert()
 
     def _clear_alert(self):
         if self.alert_active:
             self._log("Alert cleared.")
         self.alert_active = False
-        self.alert_reason = None
         self.alert_label.config(text="")
 
     def _detect_direction(self, msg):
         """Infer a heading from a log line (our own 'Sent: ...' commands, or
         anything the robot echoes back that mentions a direction word)."""
         m = msg.upper()
-        if "TABLE1" in m or "LEFT" in m:
+        if "LEFT" in m:
             return "left"
-        if "TABLE2" in m or "RIGHT" in m:
+        if "RIGHT" in m:
             return "right"
         if "STOP" in m:
             return "stop"
         if "BACK" in m or "REVERSE" in m:
             return "back"
-        if "START" in m or "FORWARD" in m or "FWD" in m:
+        if "FORWARD" in m or "FWD" in m:
             return "forward"
         return None
 
@@ -1609,19 +1528,17 @@ class RobotDashboard:
             self.obstacle_label.config(text=f"⚠ OBSTACLE AT {obstacle_dist} MM — WAITING", foreground=DANGER)
             self._log(f"Voice: \"{OBSTACLE_VOICE_MSG}\"")
             self.speech.speak(OBSTACLE_VOICE_MSG)
-            if (self.is_running or self.path_active) and not self.auto_paused:
-                pause_cmd = "PATH_PAUSE" if self.path_active else "STOP"
-                self._log(f"Obstacle detected at {obstacle_dist} mm in front 180 -> {pause_cmd}")
-                self._send(pause_cmd)
+            if self.path_active and not self.auto_paused:
+                self._log(f"Obstacle detected at {obstacle_dist} mm in front 180 -> PATH_PAUSE")
+                self._send("PATH_PAUSE")
                 self.auto_paused = True
                 self.obstacle_pause_since = time.time()
                 self._update_status()
         else:
             self.obstacle_label.config(text="✓ PATH CLEAR", foreground=SUCCESS)
             if self.auto_paused:
-                resume_cmd = "PATH_RESUME" if self.path_active else "START"
-                self._log(f"Obstacle cleared -> {resume_cmd}")
-                self._send(resume_cmd)
+                self._log("Obstacle cleared -> PATH_RESUME")
+                self._send("PATH_RESUME")
                 self.auto_paused = False
                 self.obstacle_pause_since = None
                 self._clear_alert()

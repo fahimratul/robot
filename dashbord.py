@@ -9,9 +9,17 @@ Two independent serial links:
         PATH:<steps> / PATH_STOP / PATH_PAUSE / PATH_RESUME -> scripted
             timed-move playback (built or recorded in the PATH tab)
         STOP     -> stop immediately, cancelling manual or path mode
+        FOOD     -> query the IR food-tray sensor
      The dashboard sends PATH_PAUSE/PATH_RESUME itself (in addition to the
      buttons) whenever the LiDAR sees/clears an obstacle in front of the
      robot while a path is running.
+
+     The Teensy pushes FOOD:PRESENT / FOOD:TAKEN when the IR tray sensor
+     changes. A FOOD:TAKEN after a delivery path finished is the pickup
+     event: the dashboard says "Thank you sir" and, a few seconds later,
+     drives build_return_path() - a 180 degree U-turn, the delivery path
+     retraced with its turns mirrored, then a second U-turn to park the
+     robot on its original heading.
 
      There is no closed-loop line-following or encoder odometry - the
      robot's wheel encoders have a hardware fault that can't be replaced,
@@ -70,6 +78,17 @@ except ImportError:
 
 OBSTACLE_VOICE_MSG = "Please give side"
 
+# ---- Food tray (IR sensor) + automatic return trip ----
+FOOD_TAKEN_VOICE_MSG = "Thank you sir"
+RETURN_DONE_VOICE_MSG = "Back at the counter"
+RETURN_DELAY_SECONDS = 3     # pause after the thank-you before pulling away, so the
+                              # customer hears it and steps clear of the robot
+RETURN_TURN_ACTION = "TURN RIGHT"  # which way the robot spins for its two U-turns
+RETURN_TURN_DEGREES = 180
+PATH_MAX_STEPS = 64          # must match PATH_MAX_STEPS in lineflow.ino - the firmware
+                              # silently drops steps past this, which would strand the
+                              # robot mid-return, so we refuse to send an over-long path
+
 LIDAR_BAUDRATE = 460800
 MIN_QUALITY = 5            # ignore very low-confidence points
 MAP_MAX_RANGE_MM = 4000    # canvas display range (outer ring)
@@ -79,11 +98,27 @@ PHONE_SERVER_PORT = 8765   # phone remote control - browse to http://<laptop-lan
 STALL_ALERT_SECONDS = 10   # alert the phone if stopped this long (line lost or obstacle)
 MANUAL_COMMANDS = {"MFWD", "MBACK", "MLEFT", "MRIGHT", "MSTOP"}
 
-# PATH tab step labels -> the action tokens lineflow.ino's PATH: command expects
+# PATH tab step labels -> the action tokens lineflow.ino's PATH: command expects.
+# TURN LEFT/TURN RIGHT are closed-loop (gyro, degrees); everything else is
+# open-loop/timed (seconds). TURN_ACTIONS is used wherever that unit
+# difference matters (input validation, display, wire-format conversion).
 PATH_ACTION_TOKENS = {"FORWARD": "FWD", "BACK": "BACK", "LEFT": "LEFT",
-                       "RIGHT": "RIGHT", "HOLD": "HOLD"}
+                       "RIGHT": "RIGHT", "HOLD": "HOLD",
+                       "TURN LEFT": "TURNL", "TURN RIGHT": "TURNR"}
+TURN_ACTIONS = {"TURN LEFT", "TURN RIGHT"}
 MANUAL_CMD_TO_PATH_ACTION = {"MFWD": "FORWARD", "MBACK": "BACK",
                              "MLEFT": "LEFT", "MRIGHT": "RIGHT"}
+
+# Retracing a path after a 180 degree U-turn: the robot now faces back down
+# the route, so each leg is driven the same way round (FORWARD stays FORWARD,
+# BACK stays BACK) but every turn is mirrored. Worked through: start facing
+# north, FORWARD 3s -> (0,3); TURN LEFT 90 -> facing west; FORWARD 2s ->
+# (-2,3). U-turn to face east, FORWARD 2s -> (0,3), then a *right* 90 puts
+# the robot on south, FORWARD 3s -> (0,0) home, and the closing U-turn
+# restores the original north heading.
+REVERSE_ACTION_MIRROR = {"FORWARD": "FORWARD", "BACK": "BACK", "HOLD": "HOLD",
+                         "LEFT": "RIGHT", "RIGHT": "LEFT",
+                         "TURN LEFT": "TURN RIGHT", "TURN RIGHT": "TURN LEFT"}
 
 # Library of named PATH step-sequences, persisted next to this script so
 # they survive a dashboard restart.
@@ -130,6 +165,24 @@ DIRECTION_STYLES = {
     "back":    ("▼", WARNING, "REVERSE"),
     "stop":    ("■", DANGER, "STOPPED"),
 }
+
+
+def build_return_path(steps):
+    """The delivery path, driven home: U-turn, retrace, U-turn.
+
+    Steps run in reverse order with every turn mirrored (see
+    REVERSE_ACTION_MIRROR), bracketed by two RETURN_TURN_DEGREES turns - the
+    first to face back down the route, the last to leave the robot parked on
+    its original heading, ready for the next delivery.
+
+    HOLD steps are kept so the retrace stays a faithful mirror of the drive
+    out; delete them from the PATH tab before it runs if the waits aren't
+    wanted on the way back.
+    """
+    turn = (RETURN_TURN_ACTION, RETURN_TURN_DEGREES)
+    mirrored = [(REVERSE_ACTION_MIRROR.get(action, action), value)
+                for action, value in reversed(steps)]
+    return [turn] + mirrored + [turn]
 
 
 def angle_in_front(angle_deg):
@@ -281,6 +334,8 @@ PHONE_PAGE_HTML = """<!doctype html>
   button.stop { color:#ff3b5c; border-color:#ff3b5c; }
   #stopBtn { width:100%; }
   #pathBtn { width:100%; margin-top:12px; color:#ff2ea6; border-color:#ff2ea6; }
+  #returnBtn { width:100%; margin-top:12px; color:#ffb800; border-color:#ffb800; }
+  .tray { text-align:center; margin-top:14px; font-weight:bold; font-size:0.95rem; }
   .obstacle { text-align:center; margin-top:16px; font-weight:bold; min-height:1.2em; }
   .radar-wrap { display:flex; justify-content:center; margin-top:10px; }
   #radar { background:#020508; border:1px solid #0a5f70; border-radius:8px; max-width:100%; }
@@ -304,6 +359,8 @@ PHONE_PAGE_HTML = """<!doctype html>
   <div class="status" id="status">connecting...</div>
   <button id="stopBtn" class="stop" onclick="post('/api/stop')">&#9632; STOP</button>
   <button id="pathBtn" onclick="post('/api/path/run')">&#9654; RUN PATH</button>
+  <button id="returnBtn" onclick="post('/api/path/return')">&#8617; RETURN HOME</button>
+  <div class="tray" id="tray"></div>
   <div class="obstacle" id="obstacle"></div>
 
   <div class="radar-wrap">
@@ -464,11 +521,24 @@ async function poll() {
     const s = await r.json();
     let state = 'STOPPED';
     if (s.manual_mode) state = 'MANUAL CONTROL';
-    else if (s.path_active) state = 'PATH RUNNING';
+    else if (s.path_active) state = s.returning ? 'RETURNING HOME' : 'PATH RUNNING';
     else if (s.auto_paused) state = 'WAITING (OBSTACLE)';
+    else if (s.awaiting_pickup) state = 'WAITING FOR PICKUP';
     document.getElementById('status').innerHTML =
       (s.connected ? '<b>CONNECTED</b>' : '<span style="color:#ff3b5c">DISCONNECTED</span>')
       + ' &nbsp; STATE: <b>' + state + '</b>';
+    const trayEl = document.getElementById('tray');
+    if (s.food_present === null || s.food_present === undefined) {
+      trayEl.textContent = 'TRAY: no reading';
+      trayEl.style.color = '#5b7a94';
+    } else if (s.food_present) {
+      trayEl.textContent = 'TRAY: FOOD LOADED';
+      trayEl.style.color = '#00ffa3';
+    } else {
+      trayEl.textContent = s.awaiting_pickup ? 'TRAY: EMPTY - WAITING FOR PICKUP' : 'TRAY: EMPTY';
+      trayEl.style.color = s.awaiting_pickup ? '#ffb800' : '#5b7a94';
+    }
+
     const obEl = document.getElementById('obstacle');
     obEl.textContent = s.obstacle
       ? ('\\u26A0 OBSTACLE' + (s.obstacle_dist_mm ? ' AT ' + s.obstacle_dist_mm + 'MM' : '') + ' \\u2014 WAITING')
@@ -545,6 +615,9 @@ class PhoneRequestHandler(http.server.BaseHTTPRequestHandler):
                 "path_active": d.path_active,
                 "alert": d.alert_active,
                 "stalled_seconds": None if stalled_secs is None else round(stalled_secs, 1),
+                "food_present": d.food_present,
+                "awaiting_pickup": d.awaiting_pickup,
+                "returning": d.return_active,
             })
         elif path == "/api/scan":
             with d.scan_lock:
@@ -565,6 +638,7 @@ class PhoneRequestHandler(http.server.BaseHTTPRequestHandler):
         actions = {
             "/api/stop": d._send_stop,
             "/api/path/run": d._run_path,
+            "/api/path/return": d._manual_return,
             "/api/manual/on": d._enter_manual,
             "/api/manual/fwd": lambda: d._manual_move("MFWD"),
             "/api/manual/back": lambda: d._manual_move("MBACK"),
@@ -634,7 +708,20 @@ class RobotDashboard:
         self.manual_mode = False       # True after MANUAL takeover (phone or desktop)
         self._manual_repeat_job = None  # after() handle for desktop press-and-hold
         self.path_active = False       # True while the Teensy is playing back a PATH
-        self.path_steps = []           # [(action_label, seconds), ...] built in the PATH tab
+        self.path_steps = []           # [(action_label, value), ...] built in the PATH tab -
+                                        # value is seconds, except degrees for TURN LEFT/TURN RIGHT
+
+        # ---- Food tray (IR sensor) + automatic return trip ----
+        # The delivery cycle: run a path -> PATH:DONE arms awaiting_pickup ->
+        # the IR sensor reports FOOD:TAKEN -> thank the customer, then drive
+        # build_return_path(delivery_steps). return_active marks the return
+        # trip itself so finishing it doesn't arm another pickup.
+        self.food_present = None        # None until the Teensy reports (no sensor/not connected)
+        self.delivery_steps = []        # snapshot of the last outbound path, for the retrace
+        self.awaiting_pickup = False    # delivered, waiting for the customer to take the food
+        self.return_active = False      # the path currently running IS the return trip
+        self.auto_return_enabled = tk.BooleanVar(value=True)
+        self._return_job = None         # after() handle for the post-thank-you delay
 
         # ---- Record-by-driving (manual drive -> PATH steps) ----
         self.recording = False
@@ -672,6 +759,7 @@ class RobotDashboard:
         self._build_ui()
         self._refresh_ports()
         self._draw_direction(None)
+        self._update_food_label()
         self._refresh_map()  # start the periodic canvas/obstacle-check loop
         self._start_phone_server()
 
@@ -704,6 +792,8 @@ class RobotDashboard:
                          font=FONT_MONO_BOLD)
 
         style.configure("TLabel", background=BG_PANEL, foreground=FG_TEXT, font=FONT_MONO)
+        style.configure("TCheckbutton", background=BG_PANEL, foreground=FG_TEXT, font=FONT_MONO)
+        style.map("TCheckbutton", background=[("active", BG_PANEL)])
         style.configure("Header.TLabel", background=BG_MAIN, foreground=ACCENT, font=FONT_HEADER)
         style.configure("SubHeader.TLabel", background=BG_MAIN, foreground=FG_DIM,
                          font=("Consolas", 9))
@@ -856,6 +946,16 @@ class RobotDashboard:
         self.mback_btn.bind("<ButtonPress-1>", lambda e: self._manual_press("MBACK"))
         self.mback_btn.bind("<ButtonRelease-1>", lambda e: self._manual_release())
 
+        food_frame = ttk.LabelFrame(control_tab, text="◆ FOOD TRAY (IR SENSOR)")
+        food_frame.pack(fill="x", padx=6, pady=2)
+        self.food_label = ttk.Label(food_frame, text="TRAY: —", font=FONT_STATUS,
+                                     foreground=FG_DIM)
+        self.food_label.grid(row=0, column=0, padx=(8, 16), pady=4, sticky="w")
+        ttk.Checkbutton(food_frame, text="Auto-return when food is taken",
+                        variable=self.auto_return_enabled).grid(row=0, column=1, padx=4)
+        ttk.Button(food_frame, text="↩ Return Now", style="Accent.TButton",
+                   command=self._manual_return).grid(row=0, column=2, padx=8)
+
         # ===== TAB 2: Path (fake-autonomous scripted playback) =====
         # Uses grid for the tab's own top-level rows, and gives the step
         # list a FIXED height (scrollbar for overflow) rather than
@@ -871,14 +971,19 @@ class RobotDashboard:
         builder_frame.grid(row=0, column=0, sticky="ew", padx=6, pady=(3, 1))
 
         self.path_action_var = tk.StringVar(value="FORWARD")
-        ttk.Combobox(builder_frame, textvariable=self.path_action_var,
-                     values=["FORWARD", "BACK", "LEFT", "RIGHT", "HOLD"],
-                     state="readonly", width=10).grid(row=0, column=0, padx=6, pady=3)
+        path_action_combo = ttk.Combobox(
+            builder_frame, textvariable=self.path_action_var,
+            values=["FORWARD", "BACK", "LEFT", "RIGHT", "HOLD", "TURN LEFT", "TURN RIGHT"],
+            state="readonly", width=10)
+        path_action_combo.grid(row=0, column=0, padx=6, pady=3)
+        path_action_combo.bind("<<ComboboxSelected>>", self._on_path_action_changed)
         ttk.Label(builder_frame, text="for").grid(row=0, column=1)
         self.path_duration_var = tk.StringVar(value="3")
-        ttk.Spinbox(builder_frame, from_=0.5, to=120, increment=0.5, width=6,
-                    textvariable=self.path_duration_var).grid(row=0, column=2, padx=6)
-        ttk.Label(builder_frame, text="sec").grid(row=0, column=3)
+        self.path_duration_spin = ttk.Spinbox(builder_frame, from_=0.5, to=120, increment=0.5,
+                                               width=6, textvariable=self.path_duration_var)
+        self.path_duration_spin.grid(row=0, column=2, padx=6)
+        self.path_unit_label = ttk.Label(builder_frame, text="sec")
+        self.path_unit_label.grid(row=0, column=3)
         ttk.Button(builder_frame, text="+ Add Step", command=self._add_path_step).grid(
             row=0, column=4, padx=(16, 6))
         self.record_btn = self._neon_button(
@@ -1033,11 +1138,17 @@ class RobotDashboard:
             self.connect_btn.config(text="Disconnect")
             self.stop_btn.config(state="normal")
             self._log(f"Connected to robot on {port}")
+            self._send("FOOD")  # tray state now, rather than waiting for the next pickup
         except Exception as e:
             self._log(f"Connection failed: {e}")
 
     def _disconnect(self):
         self.reader_running = False
+        self._cancel_return_job()
+        self.food_present = None
+        self.awaiting_pickup = False
+        self.return_active = False
+        self._update_food_label()
         if self.ser:
             try:
                 self.ser.close()
@@ -1062,19 +1173,35 @@ class RobotDashboard:
         if line.startswith("OK:PATH_STARTED"):
             self.path_active = True
             self._update_status()
-        elif line in ("PATH:DONE", "OK:PATH_STOPPED"):
+        elif line == "PATH:DONE":
             self.path_active = False
             self._update_status()
+            self._on_path_finished()
+        elif line == "OK:PATH_STOPPED":
+            # Cancelled, not completed - nothing was delivered, so don't arm
+            # a pickup (and abandon a return trip that was cut short).
+            self.path_active = False
+            self.awaiting_pickup = False
+            self.return_active = False
+            self._update_status()
+        elif line in ("FOOD:PRESENT", "FOOD:TAKEN", "FOOD:ABSENT"):
+            self._on_food_event(line)
+        elif line == "READY":
+            self._send("FOOD")  # resync the tray state after a Teensy reset
 
         self._log(f"Robot: {line}")
 
     def _send_stop(self):
         self._stop_recording()
+        self._cancel_return_job()  # a pending "thank you -> drive home" must not fire after a STOP
         self._send("STOP")
         self.auto_paused = False
         self.manual_mode = False
         self.path_active = False
+        self.awaiting_pickup = False
+        self.return_active = False
         self._update_status()
+        self._update_food_label()
 
     def _send(self, cmd):
         if self.recording and cmd in MANUAL_COMMANDS:
@@ -1093,13 +1220,17 @@ class RobotDashboard:
         if not (self.ser and self.ser.is_open):
             self._log("Connect to the robot first.")
             return
+        self._cancel_return_job()
         self._send("MANUAL")
         self.manual_mode = True
         self.auto_paused = False
         self.path_active = False
+        self.return_active = False
+        self.awaiting_pickup = False
         self.obstacle_pause_since = None
         self._clear_alert()
         self._update_status()
+        self._update_food_label()
         for btn in (self.mfwd_btn, self.mback_btn, self.mleft_btn, self.mright_btn, self.mstop_btn):
             btn.config(state="normal")
 
@@ -1185,17 +1316,27 @@ class RobotDashboard:
         self._record_start_time = None
 
     # ---------------- Path tab (fake-autonomous scripted playback) ----------------
+    def _on_path_action_changed(self, event=None):
+        if self.path_action_var.get() in TURN_ACTIONS:
+            self.path_unit_label.config(text="deg")
+            self.path_duration_spin.config(from_=1, to=360, increment=5)
+            self.path_duration_var.set("90")
+        else:
+            self.path_unit_label.config(text="sec")
+            self.path_duration_spin.config(from_=0.5, to=120, increment=0.5)
+            self.path_duration_var.set("3")
+
     def _add_path_step(self):
         action = self.path_action_var.get()
         try:
-            seconds = float(self.path_duration_var.get())
+            value = float(self.path_duration_var.get())
         except ValueError:
-            self._log("Invalid step duration.")
+            self._log("Invalid step value.")
             return
-        if seconds <= 0:
-            self._log("Step duration must be greater than 0.")
+        if value <= 0:
+            self._log("Step value must be greater than 0.")
             return
-        self.path_steps.append((action, seconds))
+        self.path_steps.append((action, value))
         self._refresh_path_listbox()
 
     def _remove_path_step(self):
@@ -1211,24 +1352,126 @@ class RobotDashboard:
 
     def _refresh_path_listbox(self):
         self.path_listbox.delete(0, "end")
-        for i, (action, seconds) in enumerate(self.path_steps, start=1):
-            self.path_listbox.insert("end", f"{i}. {action}  —  {seconds:g}s")
+        for i, (action, value) in enumerate(self.path_steps, start=1):
+            unit = "°" if action in TURN_ACTIONS else "s"
+            self.path_listbox.insert("end", f"{i}. {action}  —  {value:g}{unit}")
 
-    def _run_path(self):
+    def _run_path(self, is_return=False):
+        """Send the PATH tab's steps to the robot.
+
+        is_return marks the retrace built by build_return_path(), so finishing
+        it ends the delivery cycle instead of arming another pickup. Every
+        other caller (buttons, saved paths, the phone page) is an outbound
+        delivery and snapshots its steps for that retrace.
+        """
         if not (self.ser and self.ser.is_open):
             self._log("Connect to the robot first.")
             return
         if not self.path_steps:
             self._log("Path is empty - add at least one step first.")
             return
+        if len(self.path_steps) > PATH_MAX_STEPS:
+            self._log(f"Path has {len(self.path_steps)} steps - the firmware only accepts "
+                      f"{PATH_MAX_STEPS}. Shorten it before running.")
+            return
         body = ";".join(
-            f"{PATH_ACTION_TOKENS[action]},{int(round(seconds * 1000))}"
-            for action, seconds in self.path_steps
+            f"{PATH_ACTION_TOKENS[action]},"
+            f"{int(round(value)) if action in TURN_ACTIONS else int(round(value * 1000))}"
+            for action, value in self.path_steps
         )
+        self._cancel_return_job()
+        self.return_active = is_return
+        if not is_return:
+            self.delivery_steps = list(self.path_steps)
+            self.awaiting_pickup = False
         self.manual_mode = False
         self.auto_paused = False
         self._send(f"PATH:{body}")
         self._update_status()
+
+    # ---------------- Food tray + automatic return trip ----------------
+    def _on_food_event(self, line):
+        """FOOD:PRESENT / FOOD:TAKEN / FOOD:ABSENT from the Teensy's IR sensor.
+
+        FOOD:TAKEN is the only pickup event - FOOD:ABSENT is just the tray
+        state reported on connect/boot, which must never launch a return trip.
+        """
+        self.food_present = (line == "FOOD:PRESENT")
+        self._update_food_label()
+        if line != "FOOD:TAKEN":
+            return
+
+        if not self.awaiting_pickup:
+            self._log("Food taken, but no delivery is waiting for pickup - staying put.")
+            return
+        if not self.auto_return_enabled.get():
+            self._log("Food taken - auto-return is off, use ↩ Return Now to send the robot back.")
+            return
+        self._start_return_trip()
+
+    def _on_path_finished(self):
+        if self.return_active:
+            self.return_active = False
+            self.awaiting_pickup = False
+            self._log("Return trip complete - robot is back at the start, on its original heading.")
+            self.speech.speak(RETURN_DONE_VOICE_MSG)
+            return
+        if not self.delivery_steps:
+            return
+        self.awaiting_pickup = True
+        self._log("Delivery complete - waiting for the customer to take the food.")
+        self._update_food_label()
+
+    def _manual_return(self):
+        """↩ Return Now - send the robot home without waiting for the IR sensor
+        (auto-return switched off, a sensor that never fired, or a test run)."""
+        if not self.delivery_steps and not self.path_steps:
+            self._log("No delivery path to retrace - run or build a path first.")
+            return
+        self._start_return_trip()
+
+    def _start_return_trip(self):
+        self.awaiting_pickup = False
+        self._log(f"Voice: \"{FOOD_TAKEN_VOICE_MSG}\"")
+        self.speech.speak(FOOD_TAKEN_VOICE_MSG)
+        self._log(f"Returning in {RETURN_DELAY_SECONDS}s...")
+        self._cancel_return_job()
+        self._return_job = self.root.after(int(RETURN_DELAY_SECONDS * 1000),
+                                           self._send_return_path)
+
+    def _send_return_path(self):
+        self._return_job = None
+        source = self.delivery_steps or self.path_steps
+        if not source:
+            self._log("No delivery path to retrace.")
+            return
+        steps = build_return_path(source)
+        if len(steps) > PATH_MAX_STEPS:
+            self._log(f"Return path needs {len(steps)} steps but the firmware only accepts "
+                      f"{PATH_MAX_STEPS} - drive the robot back manually.")
+            return
+        # Load it into the PATH tab so the retrace is visible while it runs.
+        self.path_steps = steps
+        self._refresh_path_listbox()
+        self._log(f"Running return path ({len(steps)} steps: U-turn, {len(source)} retraced, U-turn).")
+        self._run_path(is_return=True)
+
+    def _cancel_return_job(self):
+        if self._return_job is not None:
+            self.root.after_cancel(self._return_job)
+            self._return_job = None
+
+    def _update_food_label(self):
+        if self.food_present is None:
+            text, color = "TRAY: — (no reading yet)", FG_DIM
+        elif self.food_present:
+            text, color = "TRAY: ● FOOD LOADED", SUCCESS
+        else:
+            text, color = "TRAY: ○ EMPTY", FG_DIM
+        if self.awaiting_pickup:
+            text += "  —  WAITING FOR PICKUP"
+            color = WARNING
+        self.food_label.config(text=text, foreground=color)
 
     # ---------------- Saved path library ----------------
     def _load_saved_paths(self):
@@ -1256,8 +1499,12 @@ class RobotDashboard:
         self.saved_listbox.delete(0, "end")
         for name in sorted(self.saved_paths):
             steps = self.saved_paths[name]
-            total_s = sum(seconds for _action, seconds in steps)
-            self.saved_listbox.insert("end", f"{name}  ({len(steps)} steps, {total_s:g}s)")
+            total_s = sum(value for action, value in steps if action not in TURN_ACTIONS)
+            turn_count = sum(1 for action, _value in steps if action in TURN_ACTIONS)
+            summary = f"{len(steps)} steps, {total_s:g}s"
+            if turn_count:
+                summary += f", {turn_count} turn(s)"
+            self.saved_listbox.insert("end", f"{name}  ({summary})")
 
     def _selected_saved_name(self):
         sel = self.saved_listbox.curselection()

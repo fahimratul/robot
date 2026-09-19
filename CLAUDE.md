@@ -61,6 +61,19 @@ are free.
   (port 8765) serving a phone remote-control page (stop / run path / return
   home / manual d-pad / live radar) on the LAN.
 
+- `setup_pi.sh` — one-time install on the Pi (apt deps, `venv/`, `dialout`
+  group).
+- `start_dashboard.sh` — launcher used at boot: waits for the desktop/USB to
+  settle, picks `venv/bin/python3`, runs `dashbord.py`, logs to
+  `dashboard.log` (previous boot kept as `dashboard.log.1`, both gitignored),
+  and restarts it if it crashes — but not on a clean exit, so closing the
+  window stays closed, and not after 5 instant failures in a row.
+- `install_autostart.sh` — one-time: writes
+  `~/.config/autostart/mist-cafe-bot.desktop` so the desktop session launches
+  `start_dashboard.sh`. XDG autostart rather than a systemd service because
+  the dashboard is a Tkinter window and must start inside the logged-in
+  session; needs "Desktop Autologin" in `raspi-config`. `--remove` undoes it.
+
 ## Serial protocol (Teensy ⇄ Pi) — current
 
 Plain text, newline-terminated, replies are `OK:...` / `ERR:...`:

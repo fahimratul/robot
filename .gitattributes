@@ -1,0 +1,4 @@
+# The shell scripts run on the Pi. Without this, core.autocrlf=true on a
+# Windows checkout hands them to the Pi with CRLF line endings, and bash
+# fails on the shebang with a bare "/usr/bin/env: 'bash\r': No such file".
+*.sh text eol=lf

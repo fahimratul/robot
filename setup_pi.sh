@@ -17,3 +17,6 @@ sudo usermod -aG dialout "$USER"
 echo
 echo "Done. Log out/in (or reboot) so the 'dialout' group takes effect,"
 echo "then run:  source venv/bin/activate && python3 dashbord.py"
+echo
+echo "To have the dashboard come up by itself on every power-on:"
+echo "  ./install_autostart.sh"

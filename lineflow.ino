@@ -204,15 +204,15 @@ void forward() {
 void right() {
   digitalWrite(DIR_LEFT, LOW);
   digitalWrite(DIR_RIGHT, HIGH);
-  analogWrite(PWM_LEFT, nudgeSpeed);
-  analogWrite(PWM_RIGHT, speed);
+  analogWrite(PWM_LEFT, 110);
+  analogWrite(PWM_RIGHT, 110);
 }
 
 void left() {
   digitalWrite(DIR_LEFT, HIGH);
   digitalWrite(DIR_RIGHT, LOW);
-  analogWrite(PWM_LEFT, speed);
-  analogWrite(PWM_RIGHT, nudgeSpeed);
+  analogWrite(PWM_LEFT, 110);
+  analogWrite(PWM_RIGHT, 110);
 }
 
 void stopBot() {
@@ -225,8 +225,8 @@ void stopBot() {
 void reverseBot() {
   digitalWrite(DIR_LEFT, LOW);
   digitalWrite(DIR_RIGHT, LOW);
-  analogWrite(PWM_LEFT, speed);
-  analogWrite(PWM_RIGHT, speed);
+  analogWrite(PWM_LEFT, 110);
+  analogWrite(PWM_RIGHT, 110);
 }
 
 // ---- MPU6050 gyro ----

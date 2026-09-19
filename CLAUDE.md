@@ -7,8 +7,11 @@ drift from the code.
 
 ## Hardware
 
-- **MCU**: Teensy (see `lineflow.ino`), talks to the Pi over USB serial at
-  9600 baud, plain-text newline-terminated commands.
+- **MCU**: **Teensy 4.1** (`teensy:avr:teensy41`, loader MCU `TEENSY41`),
+  talks to the Pi over USB serial, plain-text newline-terminated commands.
+  The code says 9600 baud, but Teensy USB serial ignores the rate — it
+  always runs at full USB speed. Its pins are **3.3V only, not 5V
+  tolerant**, which is why every sensor here is powered from 3.3V.
 - **Motor driver**: Cytron MDD10A, PWM+DIR per side.
 - **LiDAR**: RPLidar C1, plugged into the **Pi** directly (its own serial
   port, not through the Teensy), read by `dashbord.py` via the `rplidarc1`
@@ -51,15 +54,24 @@ are free.
   protocol. No line-following, no encoder odometry.
 - `dashbord.py` — Robot-side dashboard (Tkinter, light "classic" theme; runs
   on the Pi 5 + 7" touchscreen, tabbed CONTROL/PATH/SAVED/LIDAR MAP/LOG
-  layout sized to fit small screens). Owns two serial links (Teensy +
+  layout sized to fit small screens). Opens **fullscreen** (`-fullscreen`,
+  covering the desktop taskbar and title bar); the header's "Exit full
+  screen" button is the touch way out since there's no close button (Esc /
+  F11 too), and `DASHBOARD_WINDOWED=1` starts windowed for PC development.
+  Save As drops out of fullscreen while its name dialog is open — it's the
+  only typed input, and a fullscreen window can cover the on-screen keyboard
+  or hide the dialog behind itself. The CONTROL tab is tight at 800x480:
+  STOP shares a row with the state/alert text so the FOOD TRAY panel fits
+  (~60px spare) — check new CONTROL-tab rows against that height. Owns two serial links (Teensy +
   RPLidar C1 directly), draws the live LiDAR radar/map, auto-pauses a
   running PATH when something enters the front-180° obstacle zone and
   auto-resumes when clear, alerts (voice + phone vibration) if blocked
   >10s, lets the user build/record/save/run scripted timed-move sequences
   (PATH + SAVED tabs, see `PATH:` below), runs the food-taken → thank-you →
-  return-trip cycle off the IR sensor's events, and runs a small HTTP server
+  return-trip cycle off the IR sensor's events, shows a live gyro heading
+  dial beside the manual d-pad, and runs a small HTTP server
   (port 8765) serving a phone remote-control page (stop / run path / return
-  home / manual d-pad / live radar) on the LAN.
+  home / manual d-pad / live radar / heading) on the LAN.
 
 - `setup_pi.sh` — one-time install on the Pi (apt deps, `venv/`, `dialout`
   group).
@@ -73,6 +85,22 @@ are free.
   `start_dashboard.sh`. XDG autostart rather than a systemd service because
   the dashboard is a Tkinter window and must start inside the logged-in
   session; needs "Desktop Autologin" in `raspi-config`. `--remove` undoes it.
+- `setup_teensy_flash.sh` — one-time: installs `arduino-cli` (to
+  `~/.local/bin`) + PJRC's `teensy:avr` core, builds `teensy_loader_cli`
+  from PJRC's source (older apt builds predate Teensy 4.x), installs PJRC's
+  udev rules, adds `dialout`.
+- `flash_teensy.sh` — compile `lineflow.ino` and upload it to the Teensy
+  from the Pi, headless (`git pull && ./flash_teensy.sh`). Compiles from a
+  copy in `.build/lineflow/` (gitignored) because `arduino-cli` requires the
+  folder name to match the `.ino`. Builds for the robot's Teensy 4.1 unless
+  `arduino-cli board list` reports a different board is plugged in (then it
+  warns and builds for that; `TEENSY_FQBN=...` overrides both), finds the port
+  via `/dev/serial/by-id/usb-Teensyduino*` so it can't pick the LiDAR,
+  reboots the Teensy into its bootloader with the 134-baud trick (handled
+  by the Teensy core, so no GUI Teensy Loader is needed), uploads with
+  `teensy_loader_cli -w`, then checks for the `HDG:` stream as an
+  end-to-end "firmware running + gyro up" test. A dashboard connected at the
+  time loses its link when the Teensy reboots — Disconnect/Connect after.
 
 ## Serial protocol (Teensy ⇄ Pi) — current
 
@@ -86,9 +114,13 @@ Plain text, newline-terminated, replies are `OK:...` / `ERR:...`:
   `<steps>` is `ACTION,VALUE` pairs separated by `;`. ACTION is one of
   `FWD`/`BACK`/`LEFT`/`RIGHT`/`HOLD` (VALUE = milliseconds, open-loop/timed)
   or `TURNL`/`TURNR` (VALUE = degrees, closed-loop via the gyro — see
-  "Heading" below), built by the dashboard's PATH tab from a step list the
-  user adds to or records by driving (recording only ever produces the
-  timed actions, not TURNL/TURNR). Mutually exclusive with manual takeover
+  "Heading" below) or `ALIGN` (VALUE = degrees offset from the anchored
+  start heading, closed-loop and *absolute* — see "Absolute heading anchor"
+  below; also emits `ALIGN:<residual°>` when the step ends), built by the
+  dashboard's PATH tab from a step list the
+  user adds to or records by driving (recording produces timed
+  FWD/BACK/HOLD and gyro-measured TURNL/TURNR — see "Recording" below —
+  never ALIGN). Mutually exclusive with manual takeover
   — `MANUAL`/`STOP` cancel it. Runs non-blocking out of `loop()`, so `STOP`
   still takes effect immediately mid-path. Replies `OK:PATH_STARTED:<n>`,
   then `PATH_STEP:<i>/<n>` per step, `PATH:DONE` at the end,
@@ -104,13 +136,34 @@ Plain text, newline-terminated, replies are `OK:...` / `ERR:...`:
 - `FOOD` — query the IR tray sensor → `FOOD:PRESENT` / `FOOD:ABSENT`. The
   dashboard sends this on connect and on `READY` so its tray display starts
   in sync instead of waiting for the next pickup.
-- `HEADING_RESET` — zero `currentHeadingDeg` → `OK:HEADING_RESET`
+- `HEADING_ANCHOR` — latch `currentHeadingDeg` as `anchorHeadingDeg`, the
+  absolute reference `ALIGN` steps steer back to →
+  `OK:HEADING_ANCHOR:<deg>`. The dashboard sends it immediately before every
+  *outbound* path (never before a return trip, which must keep the
+  delivery's anchor).
+- `HEADING_RESET` — zero `currentHeadingDeg` **and** `anchorHeadingDeg` →
+  `OK:HEADING_RESET` (zeroing one without the other would silently offset
+  every later `ALIGN`)
 - `GYRO` — diagnostic → `GYRO:<OK|NOT_FOUND>,<currentHeadingDeg>`; use to
   verify the MPU6050 is wired/detected and that the value changes sensibly
   when the chassis is rotated by hand
 - Robot → Pi: `READY` on boot (followed by the initial `FOOD:PRESENT`/
   `FOOD:ABSENT`), the unsolicited tray events `FOOD:PRESENT` / `FOOD:TAKEN`
-  (see below), plus the `OK:...`/`ERR:...` replies above.
+  (see below), plus the `OK:...`/`ERR:...` replies above, and two
+  unsolicited gyro lines (added 2026-09-19):
+  - `HDG:<heading>,<gyroRightSign>,<anchor>` at 10 Hz whenever the MPU6050
+    is up, idle or not — feeds the dashboard's live gyro dial. Teensy USB
+    serial ignores the 9600 baud setting, so the stream costs nothing. The
+    dashboard keeps these (and `MTURN`) out of its log.
+  - `MTURN:<L|R>,<deg>` when a manual `MLEFT`/`MRIGHT` segment ends — the
+    gyro-measured rotation, used by the recorder (see "Recording").
+
+  **Manual commands are segmented on the Teensy**: the dashboard re-sends a
+  held button every 150ms, so only a *change* of `MFWD`/`MBACK`/`MLEFT`/
+  `MRIGHT`/`MSTOP` starts a new segment (`manualMotion`, `setManualMotion()`
+  in `lineflow.ino`). The dead-man's switch, `STOP`, and a `PATH:` starting
+  all close an open segment too (`leaveManualMode()`), so a turn is
+  reported however it ended.
 
 `PATH_MAX_STEPS` is **64** (raised from 30 on 2026-09-19): a return trip is
 the delivery path mirrored plus two U-turns, so it needs roughly double a
@@ -122,7 +175,7 @@ steps past the cap and strand the robot mid-route.
 
 Z-axis gyro only, integrated into a free-running `currentHeadingDeg` in
 `lineflow.ino` (`updateHeading()`, called every `loop()` iteration
-unconditionally). Two features use it:
+unconditionally). Three features use it:
 
 - **`TURNL`/`TURNR` PATH steps**: closed-loop turns that stop once the
   robot has rotated the target number of degrees (measured via the gyro),
@@ -133,14 +186,22 @@ unconditionally). Two features use it:
   self-correcting: it stops on rotation *magnitude*, so a wrong yaw-sign
   assumption can't affect correctness here, only whether the printed heading
   itself matches your intuition when using `GYRO` to look at it).
-- **`HEADING_HOLD`**: while a PATH `FWD`/`BACK` step drives, a simple P
-  controller (`HEADING_KP`, `HEADING_MAX_CORRECTION` in `lineflow.ino`)
-  nudges the two wheels' PWM apart to counter heading drift and drive
-  straighter. **Unverified sign** — flipping the board's mounting orientation
-  flips which way is "positive" rotation, so if this makes drift *worse*
-  instead of better on real hardware, flip the sign of `HEADING_KP`.
-  `#define HEADING_HOLD_ENABLED` toggles it off entirely without removing
-  code, in case it misbehaves before that sign is confirmed.
+- **`HEADING_HOLD`** (`applyHeadingHold()`): while driving straight — PATH
+  `FWD`/`BACK` steps **and** manual `MFWD`/`MBACK` (since 2026-09-19) — a
+  simple P controller (`HEADING_KP`, `HEADING_MAX_CORRECTION`) nudges the
+  two wheels' PWM apart to hold the heading the segment started on.
+  `HEADING_KP` is a **magnitude only**: the steering direction comes from
+  the learned `gyroRightSign` (see "Absolute heading anchor"), derived from
+  the motor functions — a positive correction runs the right wheel faster,
+  which going forward rotates the robot the way `right()` does and in
+  reverse the opposite way. Until a first turn has taught the sign,
+  heading-hold stays **off** (no correction beats a wrong one), so the very
+  first straight after boot is uncorrected. The pre-2026-09-19 version used
+  one sign for `FWD` and `BACK`, which made `BACK` steps amplify drift;
+  simulated with a 10%-weak left motor, 3s of driving now ends ~4° off
+  instead of ~36°, forward and reverse, both mounting orientations.
+  `#define HEADING_HOLD_ENABLED` still toggles it off entirely.
+- **`ALIGN` PATH steps** — absolute, see the next section.
 
 Gyro integration drifts slowly over time (fine for single steps a few
 seconds long) and the bias is calibrated once at boot while assumed
@@ -149,15 +210,66 @@ This does **not** revive the SLAM/autonomous-nav roadmap below — it gives
 heading only, not distance/position, and both are needed for occupancy-grid
 mapping or dead-reckoning.
 
+### Absolute heading anchor (`ALIGN`) — added 2026-09-19
+
+Everything else about the heading is *relative*: `TURNL`/`TURNR` and
+`HEADING_HOLD` both measure against `pathStepStartHeadingDeg`, re-snapshotted
+at every step. That keeps drift from corrupting a step, but it also means
+each step's small error (a turn stopping a few degrees early, a timed
+`LEFT`/`RIGHT` overshooting, slip) is permanent — nothing ever corrects it,
+so the robot ends each round trip a bit further off than the last.
+
+`anchorHeadingDeg` is the fix: an absolute reference that persists **across
+separate PATH commands**, so the delivery and the return trip share one.
+
+- `HEADING_ANCHOR` latches it. `dashbord.py` sends it right before every
+  outbound path (in `_run_path`, guarded by `if not is_return`).
+- An `ALIGN,<offset>` step turns until `currentHeadingDeg` is within
+  `ALIGN_TOLERANCE_DEG` (3°) of `anchorHeadingDeg + offset`, taking the short
+  way round (`normalizeDeg180`), then reports `ALIGN:<residual>`. It gives up
+  after `ALIGN_TIMEOUT_MS` (8s) rather than spinning forever if the gyro is
+  dead — the dashboard flags a residual over `ALIGN_OK_RESIDUAL_DEG` in the
+  log instead of letting it pass silently.
+- `build_return_path()` ends every return trip with `ALIGN,0`, so the robot
+  parks facing exactly the way it left, however sloppy the round trip was.
+
+**How it copes with the unverified gyro sign**: unlike `TURNL`/`TURNR`
+(magnitude only), `ALIGN` has to know *which way* to spin to reduce the
+error, which depends on the board's mounting. So it isn't assumed — it's
+learned. `gyroRightSign` records whether `right()` makes the heading rise or
+fall, captured for free whenever the robot turns deliberately — a
+`TURNL`/`TURNR` or timed `LEFT`/`RIGHT` step completing, or a manual
+`MLEFT`/`MRIGHT` segment ending (`learnGyroSign()`). It lives in RAM, so it
+is relearned after every boot from the first turn; heading-hold and the
+dashboard dial both depend on it too. If an `ALIGN` runs before anything has taught it,
+`maintainAlign()` spins `right()` and watches until the rotation exceeds
+`GYRO_SIGN_LEARN_DEG` (5°), which settles the question; a wrong initial guess
+costs at most those 5°, which the alignment then corrects. `ALIGN` is also
+the one action re-evaluated every `loop()` iteration (via `maintainAlign()`,
+like `maintainHeadingHold()`) rather than set once in `applyPathAction()`,
+because the direction can only be chosen while the error is being watched.
+
+Verified in simulation against both mounting orientations (cold start with
+the sign unknown, both turn directions, a 185° error taking the short way,
+an offset target, a full round trip, and the no-gyro timeout).
+
+The honest limit: the anchor is a gyro heading, so integration drift (roughly
+a degree or two a minute) rides on top of it. A long wait at the table eats
+into the accuracy. It is still far better than letting per-turn error pile up
+uncorrected, but it is not a compass.
+
 ### PATH tab: recording and a saved-path library
 
-- The step-builder dropdown includes `TURN LEFT`/`TURN RIGHT` alongside the
-  timed actions; picking one switches the value spinbox's unit label
-  ("sec" ↔ "deg") and range via `_on_path_action_changed()` in
-  `dashbord.py`. `TURN_ACTIONS` (a module-level set) is checked everywhere
-  the unit difference matters — step-list display, the saved-path total
-  summary, and the `PATH:` wire-format builder (degrees sent as-is,
-  everything else × 1000 for ms).
+- The step-builder dropdown includes `TURN LEFT`/`TURN RIGHT`/`ALIGN TO
+  START` alongside the timed actions; picking one switches the value
+  spinbox's unit label ("sec" ↔ "deg" ↔ "deg off start") and range via
+  `_on_path_action_changed()` in `dashbord.py`. `DEGREE_ACTIONS` (a
+  module-level set — the two turns plus `ALIGN TO START`) is checked
+  everywhere the unit difference matters — step-list display, the saved-path
+  total summary, and the `PATH:` wire-format builder (degrees sent as-is,
+  everything else × 1000 for ms). `ALIGN TO START` is the one action whose
+  value may be 0, since "no offset from the start heading" is its normal
+  case, so `_add_path_step`'s "> 0" validation excludes it.
 - **Record-by-driving**: a "● Record" toggle on the PATH tab (only usable
   while in Manual Control). While recording, every manual drive command
   (desktop dpad or phone d-pad — both funnel through `dashbord.py`'s
@@ -169,6 +281,25 @@ mapping or dead-reckoning.
   Stopping recording (or hitting global STOP, which also cancels manual
   mode) finalizes the captured sequence into the PATH tab's step list, same
   as if it had been hand-built there.
+- **Recorded turns are gyro-measured** (since 2026-09-19). The recorder
+  still appends a timed `LEFT`/`RIGHT` step when a turn ends (at send time,
+  so step order is always right), then the Teensy's `MTURN:<L|R>,<deg>`
+  report — measured at motor-off, the same moment a `TURNL`/`TURNR` step
+  stops, so playback reaches the same angle — upgrades it in place to
+  `TURN LEFT`/`TURN RIGHT <deg>` (`_on_manual_turn()`). This is the main
+  accuracy win for driven paths: a timed turn lands wherever battery level
+  and floor grip put it, a gyro turn lands on the angle. Turns under
+  `MIN_RECORDED_TURN_DEG` (2°) stay timed; with no gyro, no report arrives
+  and every turn stays timed. `FORWARD`/`BACK` stay timed — the gyro can't
+  measure distance.
+
+  Pairing reports to steps (`_record_pending_turns`) is newest-first within
+  `MTURN_MATCH_WINDOW_S` (1s), with direction checked, because two things
+  can desync a plain FIFO: a turn too short to keep (<0.05s) still gets a
+  report, so it gets a placeholder entry; and the dead-man's switch can end
+  a turn on the Teensy *before* the dashboard records it, so that report
+  finds nothing and the later entry never gets one — the window makes such
+  an entry expire instead of soaking up a later turn's angle.
 - **Saved path library**: the SAVED tab lists named path step-sequences,
   persisted to `saved_paths.json` (next to `dashbord.py`, local state, not
   checked in — see `.gitignore`) via `_load_saved_paths`/`_write_saved_paths`.
@@ -177,6 +308,17 @@ mapping or dead-reckoning.
   into the editable step list; "Run" loads it and immediately sends the
   `PATH:` command; "Delete" removes it. This is the "keep track of many
   named paths, then pick one to run" workflow.
+- **Live gyro dial** (CONTROL tab, beside the manual d-pad so it costs the
+  480px screen no height; `_draw_heading_dial()`): a top-down view of the
+  robot relative to START — the anchor, i.e. the heading the last delivery
+  set off on (or power-on before any). Arrow = robot now, shaded wedge = how
+  far it has turned from START, drawn only once >5° off (on Windows a pie
+  slice ~1° wide renders as the *whole* disc, a GDI quirk), readout amber
+  past 5°. Right turns rotate it clockwise via the learned
+  `gyroRightSign`; until a first turn it says "turn to calibrate" since it
+  may be mirrored. Shows "NO GYRO DATA" if `HDG` stops for
+  `HDG_STALE_SECONDS`. The phone page shows the same number as a text line
+  (`heading_from_start` in `/api/status`, via `_heading_from_start()`).
 - Phone remote page also has a "▶ RUN PATH" button (`/api/path/run`) that
   runs whatever's currently in `path_steps` — it does not expose the
   recording/saved-library UI, just a trigger, matching the phone page's
@@ -198,8 +340,11 @@ The delivery cycle, driven by the IR tray sensor:
 4. The return path is `build_return_path()`: a 180° turn, the delivery steps
    in reverse order with every turn mirrored (`REVERSE_ACTION_MIRROR` —
    `FORWARD`/`BACK`/`HOLD` unchanged, `LEFT`↔`RIGHT`, `TURN LEFT`↔
-   `TURN RIGHT`), then a second 180° turn so the robot parks on its original
-   heading. The mirroring is because the U-turn leaves the robot facing back
+   `TURN RIGHT`), a second 180° turn, and finally `ALIGN,0`, which trims off
+   whatever error the round trip accumulated and puts the robot back on the
+   heading anchored in step 1 (see "Absolute heading anchor"). `ALIGN` steps
+   inside the delivery path are dropped rather than mirrored — they're
+   absolute headings for the outbound route and mean nothing reversed. The mirroring is because the U-turn leaves the robot facing back
    down the route; the docstring works the geometry through with an example.
    It's loaded into the PATH tab's step list so the retrace is visible while
    it runs, and LiDAR obstacle auto-pause applies to it like any other path.

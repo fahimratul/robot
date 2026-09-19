@@ -38,7 +38,9 @@ Requires:
      installed the dashboard still runs, it just skips the voice alert)
 
 Run:
-    python robot_dashboard.py
+    python dashbord.py
+    (opens fullscreen, covering the taskbar - "Exit full screen" in the header,
+     or Esc/F11, gets out; DASHBOARD_WINDOWED=1 starts in a normal window)
 
 NOTE: the exact import path for the RPLidar class depends on how the
 'rplidarc1' package you installed is laid out. If the import below fails,
@@ -85,6 +87,9 @@ RETURN_DELAY_SECONDS = 3     # pause after the thank-you before pulling away, so
                               # customer hears it and steps clear of the robot
 RETURN_TURN_ACTION = "TURN RIGHT"  # which way the robot spins for its two U-turns
 RETURN_TURN_DEGREES = 180
+ALIGN_OK_RESIDUAL_DEG = 5    # a bigger residual from an ALIGN step means it timed out
+                              # rather than reached the heading (keep >= the firmware's
+                              # ALIGN_TOLERANCE_DEG, which is what it settles for)
 PATH_MAX_STEPS = 64          # must match PATH_MAX_STEPS in lineflow.ino - the firmware
                               # silently drops steps past this, which would strand the
                               # robot mid-return, so we refuse to send an over-long path
@@ -99,13 +104,19 @@ STALL_ALERT_SECONDS = 10   # alert the phone if stopped this long (line lost or 
 MANUAL_COMMANDS = {"MFWD", "MBACK", "MLEFT", "MRIGHT", "MSTOP"}
 
 # PATH tab step labels -> the action tokens lineflow.ino's PATH: command expects.
-# TURN LEFT/TURN RIGHT are closed-loop (gyro, degrees); everything else is
-# open-loop/timed (seconds). TURN_ACTIONS is used wherever that unit
-# difference matters (input validation, display, wire-format conversion).
+# TURN LEFT/TURN RIGHT (rotate N degrees) and ALIGN TO START (rotate until back
+# on the heading the delivery began at, +N degrees) are closed-loop via the
+# gyro and take degrees; everything else is open-loop/timed and takes seconds.
 PATH_ACTION_TOKENS = {"FORWARD": "FWD", "BACK": "BACK", "LEFT": "LEFT",
                        "RIGHT": "RIGHT", "HOLD": "HOLD",
-                       "TURN LEFT": "TURNL", "TURN RIGHT": "TURNR"}
+                       "TURN LEFT": "TURNL", "TURN RIGHT": "TURNR",
+                       "ALIGN TO START": "ALIGN"}
 TURN_ACTIONS = {"TURN LEFT", "TURN RIGHT"}
+ALIGN_ACTION = "ALIGN TO START"
+# Everything whose value is degrees rather than seconds - the unit difference
+# matters for the spinbox, the step display, the saved-path summary and the
+# PATH: wire format (degrees go as-is, seconds are multiplied into ms).
+DEGREE_ACTIONS = TURN_ACTIONS | {ALIGN_ACTION}
 MANUAL_CMD_TO_PATH_ACTION = {"MFWD": "FORWARD", "MBACK": "BACK",
                              "MLEFT": "LEFT", "MRIGHT": "RIGHT"}
 
@@ -124,6 +135,11 @@ REVERSE_ACTION_MIRROR = {"FORWARD": "FORWARD", "BACK": "BACK", "HOLD": "HOLD",
 # they survive a dashboard restart.
 SAVED_PATHS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_paths.json")
 MIN_RECORDED_GAP_SECONDS = 0.3  # idle gaps shorter than this aren't recorded as a HOLD step
+MIN_RECORDED_TURN_DEG = 2       # a gyro-measured turn smaller than this stays a timed nudge
+MTURN_MATCH_WINDOW_S = 1.0      # an MTURN report pairs with a recorded turn at most this old
+HDG_STALE_SECONDS = 1.5         # no HDG line for this long -> the dial shows "no gyro data"
+HEADING_DIAL_SIZE = 104         # px, square
+TIMED_TO_GYRO_TURN = {"LEFT": "TURN LEFT", "RIGHT": "TURN RIGHT"}
 
 # =====================================================================
 # Light "classic" theme - standard light desktop-app palette used
@@ -167,6 +183,16 @@ DIRECTION_STYLES = {
 }
 
 
+def normalize_deg180(deg):
+    """Wrap to (-180, 180] - the short way round, as lineflow.ino's ALIGN does."""
+    deg = math.fmod(deg, 360.0)
+    if deg > 180:
+        deg -= 360
+    elif deg <= -180:
+        deg += 360
+    return deg
+
+
 def build_return_path(steps):
     """The delivery path, driven home: U-turn, retrace, U-turn.
 
@@ -175,14 +201,23 @@ def build_return_path(steps):
     first to face back down the route, the last to leave the robot parked on
     its original heading, ready for the next delivery.
 
+    The last step is ALIGN TO START, which turns until the gyro says the robot
+    is back on the heading the delivery began at (HEADING_ANCHOR, latched when
+    the outbound path was sent). The U-turn before it does the bulk of the
+    rotation; ALIGN trims off whatever every step of the round trip
+    accumulated, so the robot parks facing the way it left instead of drifting
+    a few degrees further off with each delivery.
+
     HOLD steps are kept so the retrace stays a faithful mirror of the drive
     out; delete them from the PATH tab before it runs if the waits aren't
-    wanted on the way back.
+    wanted on the way back. ALIGN steps in the delivery path are dropped -
+    they're absolute headings for the outbound route and mean nothing
+    reversed.
     """
     turn = (RETURN_TURN_ACTION, RETURN_TURN_DEGREES)
     mirrored = [(REVERSE_ACTION_MIRROR.get(action, action), value)
-                for action, value in reversed(steps)]
-    return [turn] + mirrored + [turn]
+                for action, value in reversed(steps) if action != ALIGN_ACTION]
+    return [turn] + mirrored + [turn, (ALIGN_ACTION, 0)]
 
 
 def angle_in_front(angle_deg):
@@ -361,6 +396,7 @@ PHONE_PAGE_HTML = """<!doctype html>
   <button id="pathBtn" onclick="post('/api/path/run')">&#9654; RUN PATH</button>
   <button id="returnBtn" onclick="post('/api/path/return')">&#8617; RETURN HOME</button>
   <div class="tray" id="tray"></div>
+  <div class="tray" id="heading"></div>
   <div class="obstacle" id="obstacle"></div>
 
   <div class="radar-wrap">
@@ -539,6 +575,17 @@ async function poll() {
       trayEl.style.color = s.awaiting_pickup ? '#ffb800' : '#5b7a94';
     }
 
+    const hdEl = document.getElementById('heading');
+    if (s.heading_from_start === null || s.heading_from_start === undefined) {
+      hdEl.textContent = 'HEADING: no gyro data';
+      hdEl.style.color = '#5b7a94';
+    } else {
+      const h = s.heading_from_start;
+      hdEl.textContent = 'HEADING: ' + (h > 0 ? '+' : '') + h + ' deg from start'
+        + (s.gyro_calibrated ? '' : ' (turn once to calibrate)');
+      hdEl.style.color = Math.abs(h) > 5 ? '#ffb800' : '#00ffa3';
+    }
+
     const obEl = document.getElementById('obstacle');
     obEl.textContent = s.obstacle
       ? ('\\u26A0 OBSTACLE' + (s.obstacle_dist_mm ? ' AT ' + s.obstacle_dist_mm + 'MM' : '') + ' \\u2014 WAITING')
@@ -606,6 +653,9 @@ class PhoneRequestHandler(http.server.BaseHTTPRequestHandler):
             stalled_secs = None
             if d.obstacle_pause_since is not None:
                 stalled_secs = now - d.obstacle_pause_since
+            # Read once: this runs on the HTTP thread, and the Tk thread can
+            # blank the heading (stale gyro) between two separate reads.
+            heading = d._heading_from_start()
             self._send_json({
                 "connected": bool(d.ser and d.ser.is_open),
                 "auto_paused": d.auto_paused,
@@ -618,6 +668,8 @@ class PhoneRequestHandler(http.server.BaseHTTPRequestHandler):
                 "food_present": d.food_present,
                 "awaiting_pickup": d.awaiting_pickup,
                 "returning": d.return_active,
+                "heading_from_start": None if heading is None else round(heading),
+                "gyro_calibrated": bool(d.gyro_right_sign),
             })
         elif path == "/api/scan":
             with d.scan_lock:
@@ -702,6 +754,15 @@ class RobotDashboard:
             except tk.TclError:
                 pass
 
+        # True fullscreen by default: covers the desktop taskbar and drops the
+        # title bar, so the whole 800x480 panel is dashboard. That also removes
+        # the window's close button, and a touchscreen has no F11 - the header's
+        # "Exit full screen" button is the way out. Set DASHBOARD_WINDOWED=1 to
+        # start in a normal window (developing on a PC).
+        self.fullscreen = not os.environ.get("DASHBOARD_WINDOWED")
+        self.root.bind("<F11>", lambda e: self._set_fullscreen(not self.fullscreen))
+        self.root.bind("<Escape>", lambda e: self._set_fullscreen(False))
+
         # ---- Robot serial state ----
         self.ser = None
         self.reader_running = False
@@ -728,6 +789,16 @@ class RobotDashboard:
         self._record_active_cmd = None   # currently-held MFWD/MBACK/MLEFT/MRIGHT, or None
         self._record_start_time = None   # time.time() when _record_active_cmd started
         self._record_idle_since = None   # time.time() since the last release, for HOLD gaps
+        # Recorded LEFT/RIGHT steps (indices into path_steps) waiting for the
+        # Teensy's MTURN report of how far that turn really rotated, which
+        # upgrades them to gyro-measured TURN LEFT/RIGHT - see _on_manual_turn.
+        self._record_pending_turns = []
+
+        # ---- Live gyro (HDG stream from the Teensy, drawn on the heading dial) ----
+        self.heading_deg = None          # raw integrated heading; None until the first HDG
+        self.gyro_right_sign = 0         # +1/-1 once the Teensy has learned it, 0 = not yet
+        self.anchor_deg = 0.0            # heading latched by the last HEADING_ANCHOR
+        self._last_hdg_time = None       # time.time() of the last HDG line, for staleness
 
         # ---- Saved path library (persisted to SAVED_PATHS_FILE) ----
         self.saved_paths = {}             # {name: [(action_label, seconds), ...]}
@@ -760,6 +831,8 @@ class RobotDashboard:
         self._refresh_ports()
         self._draw_direction(None)
         self._update_food_label()
+        self._draw_heading_dial()
+        self._set_fullscreen(self.fullscreen)
         self._refresh_map()  # start the periodic canvas/obstacle-check loop
         self._start_phone_server()
 
@@ -834,9 +907,18 @@ class RobotDashboard:
         # drawn, even when forced to an unmissable debug color) - ttk.Button
         # rendered correctly in every context tested, including these same
         # tabs, so these styles sidestep the issue rather than chase it.
+        style.configure("Small.TButton", font=("Consolas", 8), padding=[6, 1])
         style.configure("Success.TButton", foreground=SUCCESS)
         style.configure("Danger.TButton", foreground=DANGER)
         style.configure("Accent.TButton", foreground=ACCENT)
+
+    def _set_fullscreen(self, on):
+        self.fullscreen = on
+        try:
+            self.root.attributes("-fullscreen", on)
+        except tk.TclError:
+            pass  # a window manager that can't do it - stay a screen-sized window
+        self.fullscreen_btn.config(text="Exit full screen" if on else "Full screen")
 
     def _neon_button(self, parent, **kwargs):
         # highlightthickness=0 is deliberately avoided here: on some Tk/Windows
@@ -858,6 +940,12 @@ class RobotDashboard:
         header = ttk.Label(self.root, text="◈ MIST CAFE BOT ◈",
                             style="Header.TLabel", anchor="center")
         header.pack(fill="x", pady=(4, 0))
+        # Placed over the header's right end rather than packed beside it, so
+        # the title stays centred and the button costs the 480px screen no
+        # extra height.
+        self.fullscreen_btn = ttk.Button(header, style="Small.TButton",
+                                         command=lambda: self._set_fullscreen(not self.fullscreen))
+        self.fullscreen_btn.place(relx=1.0, rely=0.5, x=-6, anchor="e")
         if not self.compact:
             sub = ttk.Label(self.root, text="TEENSY LINK · RPLIDAR C1 · REAL-TIME OBSTACLE FIELD",
                              style="SubHeader.TLabel", anchor="center")
@@ -900,20 +988,25 @@ class RobotDashboard:
                                           wraplength=760)
         self.phone_url_label.grid(row=1, column=0, columnspan=4, padx=6, pady=(0, 2), sticky="w")
 
-        control_frame = ttk.LabelFrame(control_tab, text="◆ CONTROL")
-        control_frame.pack(fill="x", padx=6, pady=2)
+        # STOP, the state line and the alert line share one row: stacked, they
+        # (a whole bordered panel for one button, plus two text rows, the
+        # alert one usually empty) pushed the FOOD TRAY panel off the bottom
+        # of the 800x480 screen. STOP keeps its full size, at the right.
+        control_frame = ttk.Frame(control_tab)
+        control_frame.pack(fill="x", padx=6, pady=(3, 2))
+        control_frame.columnconfigure(0, weight=1)
         self.stop_btn = self._neon_button(control_frame, text="■ STOP", width=16, height=2,
                                            fg=DANGER, activebackground=DANGER_TINT,
                                            state="disabled", command=self._send_stop)
-        self.stop_btn.pack(padx=6, pady=6)
+        self.stop_btn.grid(row=0, column=1, rowspan=2, padx=(8, 0), sticky="e")
 
-        self.status_label = ttk.Label(control_tab, text="STATE: STOPPED",
-                                       font=FONT_STATUS, foreground=ACCENT)
-        self.status_label.pack(fill="x", padx=6, pady=(0, 1))
+        self.status_label = ttk.Label(control_frame, text="STATE: STOPPED",
+                                       font=FONT_STATUS, foreground=ACCENT, background=BG_MAIN)
+        self.status_label.grid(row=0, column=0, sticky="w")
 
-        self.alert_label = ttk.Label(control_tab, text="", font=FONT_STATUS, foreground=DANGER,
-                                      wraplength=760)
-        self.alert_label.pack(fill="x", padx=6, pady=(0, 2))
+        self.alert_label = ttk.Label(control_frame, text="", font=FONT_STATUS, foreground=DANGER,
+                                      background=BG_MAIN, wraplength=560)
+        self.alert_label.grid(row=1, column=0, sticky="w")
 
         manual_frame = ttk.LabelFrame(control_tab, text="◆ MANUAL DRIVE (TAKEOVER)")
         manual_frame.pack(fill="x", padx=6, pady=2)
@@ -946,6 +1039,14 @@ class RobotDashboard:
         self.mback_btn.bind("<ButtonPress-1>", lambda e: self._manual_press("MBACK"))
         self.mback_btn.bind("<ButtonRelease-1>", lambda e: self._manual_release())
 
+        # Live gyro dial - sits beside the d-pad (which is only ~3 rows tall)
+        # so it's in view while driving without costing the 480px screen any
+        # height. Redrawn on every HDG line from the Teensy (10 Hz).
+        self.heading_canvas = tk.Canvas(manual_frame, width=HEADING_DIAL_SIZE,
+                                         height=HEADING_DIAL_SIZE, bg=BG_INSET,
+                                         highlightthickness=1, highlightbackground=ACCENT_DIM)
+        self.heading_canvas.grid(row=0, column=4, rowspan=3, padx=(16, 8), pady=3)
+
         food_frame = ttk.LabelFrame(control_tab, text="◆ FOOD TRAY (IR SENSOR)")
         food_frame.pack(fill="x", padx=6, pady=2)
         self.food_label = ttk.Label(food_frame, text="TRAY: —", font=FONT_STATUS,
@@ -973,8 +1074,9 @@ class RobotDashboard:
         self.path_action_var = tk.StringVar(value="FORWARD")
         path_action_combo = ttk.Combobox(
             builder_frame, textvariable=self.path_action_var,
-            values=["FORWARD", "BACK", "LEFT", "RIGHT", "HOLD", "TURN LEFT", "TURN RIGHT"],
-            state="readonly", width=10)
+            values=["FORWARD", "BACK", "LEFT", "RIGHT", "HOLD", "TURN LEFT", "TURN RIGHT",
+                    ALIGN_ACTION],
+            state="readonly", width=14)
         path_action_combo.grid(row=0, column=0, padx=6, pady=3)
         path_action_combo.bind("<<ComboboxSelected>>", self._on_path_action_changed)
         ttk.Label(builder_frame, text="for").grid(row=0, column=1)
@@ -1149,6 +1251,8 @@ class RobotDashboard:
         self.awaiting_pickup = False
         self.return_active = False
         self._update_food_label()
+        self.heading_deg = None
+        self._draw_heading_dial()
         if self.ser:
             try:
                 self.ser.close()
@@ -1170,6 +1274,15 @@ class RobotDashboard:
                 break
 
     def _on_robot_line(self, line):
+        # High-rate telemetry first, and kept out of the log: HDG arrives 10x a
+        # second and would bury everything else.
+        if line.startswith("HDG:"):
+            self._on_heading(line)
+            return
+        if line.startswith("MTURN:"):
+            self._on_manual_turn(line)
+            return
+
         if line.startswith("OK:PATH_STARTED"):
             self.path_active = True
             self._update_status()
@@ -1184,6 +1297,20 @@ class RobotDashboard:
             self.awaiting_pickup = False
             self.return_active = False
             self._update_status()
+        elif line.startswith("ALIGN:"):
+            # Residual heading error once the ALIGN step finished. Near 0 means
+            # the robot really is back on its start heading; a large value
+            # means it timed out (gyro missing, or something blocked the spin).
+            try:
+                residual = float(line.split(":", 1)[1])
+            except ValueError:
+                pass
+            else:
+                if abs(residual) <= ALIGN_OK_RESIDUAL_DEG:
+                    self._log(f"Aligned to the start heading ({residual:+.1f}° off).")
+                else:
+                    self._log(f"⚠ ALIGN gave up {residual:+.1f}° off the start heading - "
+                              f"check the gyro (send GYRO) or whether the robot could turn.")
         elif line in ("FOOD:PRESENT", "FOOD:TAKEN", "FOOD:ABSENT"):
             self._on_food_event(line)
         elif line == "READY":
@@ -1266,6 +1393,7 @@ class RobotDashboard:
         self.path_steps.clear()
         self._refresh_path_listbox()
         self.recording = True
+        self._record_pending_turns = []
         self._record_active_cmd = None
         self._record_start_time = None
         self._record_idle_since = time.time()
@@ -1308,16 +1436,70 @@ class RobotDashboard:
 
     def _finish_record_segment(self, end_time):
         duration = end_time - self._record_start_time
+        action = MANUAL_CMD_TO_PATH_ACTION[self._record_active_cmd]
+        index = None
         if duration >= 0.05:
-            action = MANUAL_CMD_TO_PATH_ACTION[self._record_active_cmd]
             self.path_steps.append((action, round(duration, 1)))
+            index = len(self.path_steps) - 1
             self._refresh_path_listbox()
+        if action in TIMED_TO_GYRO_TURN:
+            # The Teensy reports every manual turn, even one too short to keep
+            # here, so a dropped one still gets an entry (index None) - its
+            # report must land on it, not on the next real turn.
+            self._record_pending_turns.append((index, action, time.time()))
         self._record_active_cmd = None
         self._record_start_time = None
 
+    def _on_manual_turn(self, line):
+        """MTURN:<L|R>,<deg> - the Teensy's gyro measurement of a manual turn
+        that just ended. If it's a turn we recorded, swap the timed LEFT/RIGHT
+        step for a TURN LEFT/RIGHT of the measured angle, so playback turns by
+        the gyro (closed-loop, same angle every time) instead of by the clock
+        (whatever battery level and floor grip make of 1.3 seconds).
+
+        Forward/back steps stay timed: the gyro measures rotation, not
+        distance, so there's nothing better to replace them with.
+        """
+        try:
+            direction, deg_txt = line[len("MTURN:"):].split(",")
+            deg = float(deg_txt)
+        except ValueError:
+            return
+        action = {"L": "LEFT", "R": "RIGHT"}.get(direction)
+
+        # The report describes the turn that *just* ended - the newest entry.
+        # Reports land within milliseconds of the step being recorded, so an
+        # entry older than the window lost its report (the dead-man's switch
+        # ended that turn before the dashboard did) and is dropped rather than
+        # left to soak up some later turn's angle.
+        now = time.time()
+        self._record_pending_turns = [p for p in self._record_pending_turns
+                                      if now - p[2] <= MTURN_MATCH_WINDOW_S]
+        if not self._record_pending_turns:
+            return  # not a turn we recorded (recording off, or already matched)
+        index, pending_action, _ = self._record_pending_turns.pop()
+        if index is None or pending_action != action:
+            return
+        if index >= len(self.path_steps) or self.path_steps[index][0] != action:
+            return  # the step list was edited or cleared in the meantime
+        if deg < MIN_RECORDED_TURN_DEG:
+            return  # a nudge too small to be worth a gyro turn - keep it timed
+        gyro_action = TIMED_TO_GYRO_TURN[action]
+        self.path_steps[index] = (gyro_action, int(round(deg)))
+        self._refresh_path_listbox()
+        self._log(f"Recorded turn measured by gyro: {gyro_action} {deg:.0f}°")
+
     # ---------------- Path tab (fake-autonomous scripted playback) ----------------
     def _on_path_action_changed(self, event=None):
-        if self.path_action_var.get() in TURN_ACTIONS:
+        action = self.path_action_var.get()
+        if action == ALIGN_ACTION:
+            # The value is an offset from the anchored start heading, so 0 -
+            # "face exactly the way this delivery began" - is both the useful
+            # default and a legal value, unlike a turn of 0 degrees.
+            self.path_unit_label.config(text="deg off start")
+            self.path_duration_spin.config(from_=0, to=359, increment=15)
+            self.path_duration_var.set("0")
+        elif action in DEGREE_ACTIONS:
             self.path_unit_label.config(text="deg")
             self.path_duration_spin.config(from_=1, to=360, increment=5)
             self.path_duration_var.set("90")
@@ -1333,7 +1515,9 @@ class RobotDashboard:
         except ValueError:
             self._log("Invalid step value.")
             return
-        if value <= 0:
+        if value < 0 or (value == 0 and action != ALIGN_ACTION):
+            # 0 is meaningless as a duration or a turn, but it's the normal
+            # case for ALIGN: no offset from the start heading.
             self._log("Step value must be greater than 0.")
             return
         self.path_steps.append((action, value))
@@ -1353,8 +1537,11 @@ class RobotDashboard:
     def _refresh_path_listbox(self):
         self.path_listbox.delete(0, "end")
         for i, (action, value) in enumerate(self.path_steps, start=1):
-            unit = "°" if action in TURN_ACTIONS else "s"
-            self.path_listbox.insert("end", f"{i}. {action}  —  {value:g}{unit}")
+            if action == ALIGN_ACTION:
+                label = f"{action}  —  start heading{f' +{value:g}°' if value else ''}"
+            else:
+                label = f"{action}  —  {value:g}{'°' if action in DEGREE_ACTIONS else 's'}"
+            self.path_listbox.insert("end", f"{i}. {label}")
 
     def _run_path(self, is_return=False):
         """Send the PATH tab's steps to the robot.
@@ -1376,7 +1563,7 @@ class RobotDashboard:
             return
         body = ";".join(
             f"{PATH_ACTION_TOKENS[action]},"
-            f"{int(round(value)) if action in TURN_ACTIONS else int(round(value * 1000))}"
+            f"{int(round(value)) if action in DEGREE_ACTIONS else int(round(value * 1000))}"
             for action, value in self.path_steps
         )
         self._cancel_return_job()
@@ -1384,6 +1571,10 @@ class RobotDashboard:
         if not is_return:
             self.delivery_steps = list(self.path_steps)
             self.awaiting_pickup = False
+            # Latch the heading the robot is leaving on, before it moves. The
+            # return trip's closing ALIGN step steers back to exactly this,
+            # across both PATH commands and the wait at the table.
+            self._send("HEADING_ANCHOR")
         self.manual_mode = False
         self.auto_paused = False
         self._send(f"PATH:{body}")
@@ -1499,8 +1690,8 @@ class RobotDashboard:
         self.saved_listbox.delete(0, "end")
         for name in sorted(self.saved_paths):
             steps = self.saved_paths[name]
-            total_s = sum(value for action, value in steps if action not in TURN_ACTIONS)
-            turn_count = sum(1 for action, _value in steps if action in TURN_ACTIONS)
+            total_s = sum(value for action, value in steps if action not in DEGREE_ACTIONS)
+            turn_count = sum(1 for action, _value in steps if action in DEGREE_ACTIONS)
             summary = f"{len(steps)} steps, {total_s:g}s"
             if turn_count:
                 summary += f", {turn_count} turn(s)"
@@ -1517,7 +1708,18 @@ class RobotDashboard:
         if not self.path_steps:
             self._log("Nothing to save - add steps or record a drive first.")
             return
-        name = simpledialog.askstring("Save Path", "Name this path:", parent=self.root)
+        # The only typed input in the app. Drop out of fullscreen while it's
+        # open: a fullscreen window can cover the touchscreen's on-screen
+        # keyboard, and on some window managers the dialog itself opens
+        # *behind* it - a modal nobody can see looks like a frozen app.
+        was_fullscreen = self.fullscreen
+        if was_fullscreen:
+            self._set_fullscreen(False)
+        try:
+            name = simpledialog.askstring("Save Path", "Name this path:", parent=self.root)
+        finally:
+            if was_fullscreen:
+                self._set_fullscreen(True)
         if not name:
             return
         name = name.strip()
@@ -1620,6 +1822,97 @@ class RobotDashboard:
         self.log_text.see("end")
         self.log_text.config(state="disabled")
 
+    # ---------------- Live gyro dial ----------------
+    def _on_heading(self, line):
+        """HDG:<heading>,<gyroRightSign>,<anchor> - the Teensy's 10 Hz stream."""
+        try:
+            heading, sign, anchor = line[len("HDG:"):].split(",")
+            self.heading_deg = float(heading)
+            self.gyro_right_sign = int(sign)
+            self.anchor_deg = float(anchor)
+        except ValueError:
+            return
+        self._last_hdg_time = time.time()
+        self._draw_heading_dial()
+
+    def _heading_from_start(self):
+        """Degrees turned from START (the anchor), right turns positive, or
+        None without live gyro data. The raw heading's sign depends on how the
+        MPU6050 is mounted; the Teensy's learned gyroRightSign undoes that."""
+        heading = self.heading_deg  # one read - the phone API calls this off the Tk thread
+        if heading is None:
+            return None
+        mirror = self.gyro_right_sign if self.gyro_right_sign else 1
+        return normalize_deg180((heading - self.anchor_deg) * mirror)
+
+    def _check_heading_stale(self):
+        # The stream stops if the gyro drops out or the link does - say so on
+        # the dial rather than freeze on the last heading as if it were live.
+        if (self.heading_deg is not None and self._last_hdg_time is not None
+                and time.time() - self._last_hdg_time > HDG_STALE_SECONDS):
+            self.heading_deg = None
+            self._draw_heading_dial()
+
+    def _draw_heading_dial(self):
+        """Top-down view of the robot relative to the heading it started on.
+
+        "START" at the top is the anchor (the heading latched when the last
+        delivery set off - or power-on, before any). The arrow is the robot
+        now, the shaded wedge how far it has turned from START. A right turn
+        rotates the arrow clockwise, which needs the gyro's mounting sign -
+        until the Teensy has learned it from a first turn, the drawing may be
+        mirrored and the dial says so.
+        """
+        c = self.heading_canvas
+        c.delete("all")
+        size = HEADING_DIAL_SIZE
+        # Ring between the START label above and two text lines below.
+        ring_top, text_band = 16, 26
+        r = (size - ring_top - text_band) / 2
+        cx, cy = size / 2, ring_top + r
+
+        c.create_oval(cx - r, cy - r, cx + r, cy + r, outline=ACCENT_DIM, width=2)
+        for tick in range(0, 360, 45):
+            a = math.radians(tick - 90)
+            inner = r - (6 if tick % 90 == 0 else 3)
+            c.create_line(cx + inner * math.cos(a), cy + inner * math.sin(a),
+                          cx + r * math.cos(a), cy + r * math.sin(a), fill=ACCENT_DIM)
+        c.create_text(cx, 6, text="START", fill=FG_DIM, font=("Consolas", 7, "bold"))
+        c.create_polygon(cx, ring_top + 1, cx - 4, ring_top - 5, cx + 4, ring_top - 5,
+                         fill=SUCCESS, outline="")
+
+        if self.heading_deg is None:
+            c.create_text(cx, cy, text="NO GYRO\nDATA", fill=FG_DIM, justify="center",
+                          font=("Consolas", 8, "bold"))
+            c.create_text(cx, size - 8, text="send GYRO to check", fill=FG_DIM,
+                          font=("Consolas", 6))
+            return
+
+        rel = self._heading_from_start()
+        off_start = abs(rel) > 5
+
+        if off_start:
+            # Only once visibly off START: on Windows a pie slice only a
+            # degree or so wide - edge points landing on the same pixel -
+            # is drawn by GDI as the *whole* disc.
+            # Tk arcs: 0 deg = 3 o'clock, counter-clockwise positive.
+            c.create_arc(cx - r + 4, cy - r + 4, cx + r - 4, cy + r - 4, start=90, extent=-rel,
+                         fill=MAP_SECTOR_FILL, outline=ACCENT_DIM, style="pieslice")
+
+        a = math.radians(rel)
+        arrow = [(0, -r + 6), (-8, 9), (0, 3), (8, 9)]  # pointing up before rotation
+        pts = []
+        for px, py in arrow:
+            pts.extend((cx + px * math.cos(a) - py * math.sin(a),
+                        cy + px * math.sin(a) + py * math.cos(a)))
+        c.create_polygon(pts, fill=ACCENT, outline="")
+
+        c.create_text(cx, size - 17, text=f"{rel:+.0f}°", font=("Consolas", 9, "bold"),
+                      fill=WARNING if off_start else SUCCESS)
+        c.create_text(cx, size - 6, font=("Consolas", 6),
+                      text="gyro OK" if self.gyro_right_sign else "turn to calibrate",
+                      fill=FG_DIM)
+
     # ---------------- Direction indicator ----------------
     def _set_direction(self, direction):
         if direction == self.current_direction:
@@ -1699,6 +1992,7 @@ class RobotDashboard:
     def _refresh_map(self):
         self._draw_map_and_check_obstacle()
         self._check_stall_alert()
+        self._check_heading_stale()
         self.root.after(150, self._refresh_map)  # ~6-7 Hz refresh
 
     def _draw_map_and_check_obstacle(self):

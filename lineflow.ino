@@ -7,7 +7,9 @@
 // before its definition and fail to compile ("'PathAction' was not
 // declared in this scope"). See the PATH PLAYBACK section below for its use.
 enum PathAction { PATH_FWD, PATH_BACK, PATH_LEFT, PATH_RIGHT, PATH_HOLD,
-                   PATH_TURN_LEFT, PATH_TURN_RIGHT };
+                   PATH_TURN_LEFT, PATH_TURN_RIGHT, PATH_ALIGN };
+// Same reason - see the manual drive section for its use.
+enum ManualMotion { MM_STOP, MM_FWD, MM_BACK, MM_LEFT, MM_RIGHT };
 
 // =====================================================================
 // All global state lives up here in one block, before any function
@@ -59,6 +61,26 @@ bool manualMode = false;
 unsigned long lastManualCmdTime = 0;
 const unsigned long MANUAL_TIMEOUT_MS = 400;
 
+// What the motors are actually doing under manual control, and the heading
+// when that started. The dashboard re-sends a held button every 150ms, so a
+// repeat of the same command is the *same* segment - only a change counts.
+// Tracking segments here (not on the Pi) means they reflect what the motors
+// really did, dead-man's-switch stops included, with the heading measured at
+// the exact moment the motion changed rather than whenever a report arrived.
+//  - MFWD/MBACK hold the segment's starting heading (heading-hold, as in PATH
+//    FWD/BACK steps), so manual driving goes straight too.
+//  - When a MLEFT/MRIGHT segment ends, the rotation it produced is reported as
+//    MTURN:<L|R>,<deg>, which the dashboard's recorder uses to store the turn
+//    as a gyro-measured TURN LEFT/RIGHT instead of a timed LEFT/RIGHT.
+ManualMotion manualMotion = MM_STOP;
+double manualSegStartHeadingDeg = 0.0;
+
+// ---- Live heading stream (the dashboard's gyro dial) ----
+// HDG:<heading>,<gyroRightSign>,<anchor> at 10 Hz whenever the gyro is up.
+// Teensy USB serial ignores the baud rate, so this costs nothing on the link.
+const unsigned long HEADING_REPORT_MS = 100;
+unsigned long lastHeadingReportMs = 0;
+
 String inputBuffer = "";
 
 // ---- MPU6050 gyro (heading via yaw-rate integration) ----
@@ -77,9 +99,9 @@ String inputBuffer = "";
 //    which way the board is mounted (flipping it flips the sign). This does
 //    NOT affect the TURNL/TURNR feature (it stops on the *magnitude* of
 //    rotation, so direction is already correct via the existing/tuned
-//    left()/right() functions) - it DOES matter for HEADING_HOLD below: if
-//    the robot's drift correction makes veering worse instead of better,
-//    flip the sign of HEADING_KP.
+//    left()/right() functions). Heading-hold and ALIGN do need it, and
+//    learn it from the robot's own turns (gyroRightSign, below) rather than
+//    assuming - nothing to flip by hand.
 #define MPU_ADDR 0x68
 const double GYRO_SENS_LSB_PER_DPS = 131.0;  // datasheet value for +-250 deg/s (GYRO_CONFIG=0x00)
 
@@ -89,16 +111,51 @@ double currentHeadingDeg = 0.0;      // free-running integrated yaw; drifts slow
 double gyroZBiasDegPerSec = 0.0;     // measured once at boot while stationary
 unsigned long lastHeadingUpdateUs = 0;
 
-// ---- Heading-hold (steering correction during FWD/BACK) ----
+// ---- Heading-hold (steering correction while driving straight) ----
 // Simple P controller, no integral/derivative - good enough for short
-// steps, TUNE HEADING_KP on real hardware. Set to false to disable
-// entirely without removing the code, in case it misbehaves before
-// HEADING_KP's sign is confirmed on hardware (see the MPU6050 note above).
+// straight runs. Applies to PATH FWD/BACK steps and to manual MFWD/MBACK.
+// HEADING_KP is a magnitude only: which way to steer comes from the learned
+// gyroRightSign, and heading-hold stays off until a turn has taught it (the
+// first turn after boot, manual or scripted) - no correction at all beats a
+// correction in the wrong direction. Set to false to disable entirely.
 #define HEADING_HOLD_ENABLED true
-double HEADING_KP = 1.2;               // PWM counts of correction per degree of drift - TUNE
+double HEADING_KP = 1.2;               // PWM counts of correction per degree of drift - TUNE (keep > 0)
 const int HEADING_MAX_CORRECTION = 25; // clamp so correction can't overpower the base speed - TUNE
 
 double pathStepStartHeadingDeg = 0.0;  // currentHeadingDeg snapshot at the start of the active step
+
+// ---- Absolute heading anchor (ALIGN steps) ----
+// TURNL/TURNR only measure rotation *within* one step, so each turn's small
+// error (stopping a few degrees early/late, a timed LEFT/RIGHT overshooting,
+// drift while driving) accumulates over a route with nothing to correct it.
+// HEADING_ANCHOR latches "this is the heading I started the delivery on" and
+// survives across separate PATH commands; an ALIGN step then turns until the
+// robot is back on that heading (plus an optional offset), wiping out
+// everything that accumulated in between. The dashboard anchors when it
+// starts a delivery and ends the return trip with ALIGN,0, so the robot
+// parks facing exactly the way it left rather than a few degrees off each
+// round trip.
+//
+// The anchor is only as good as the gyro underneath it: integration drift
+// (roughly a degree or two per minute) rides on top of the stored value, so
+// a long stand at the table eats into the accuracy. Still far better than
+// letting per-turn error pile up uncorrected.
+double anchorHeadingDeg = 0.0;
+double alignTargetDeg = 0.0;           // anchorHeadingDeg + this step's offset
+
+// Which way an ALIGN step has to spin depends on whether right() makes
+// currentHeadingDeg rise or fall - i.e. on the gyro's sign convention, which
+// depends on how the MPU6050 happens to be mounted and is NOT verified on
+// this robot. Rather than assume, this is *learned* from the robot's own
+// motion: any turn big enough to be unambiguous records the answer here, and
+// an ALIGN step with no answer yet spins right() until it has one (see
+// maintainAlign). +1 = right() increases the heading, -1 = decreases, 0 =
+// not known yet. TURNL/TURNR never need it - they stop on magnitude.
+int gyroRightSign = 0;
+const double GYRO_SIGN_LEARN_DEG = 5.0;   // rotation needed before the sign is trustworthy
+
+const double ALIGN_TOLERANCE_DEG = 3.0;      // close enough - tighter than this chases gyro noise
+const unsigned long ALIGN_TIMEOUT_MS = 8000; // give up rather than spin forever if the gyro is dead
 
 // ---- Path playback (scripted timed/turn moves) ----
 // A user-authored sequence of steps sent from the dashboard, e.g. "forward
@@ -261,26 +318,140 @@ void updateFoodSensor() {
 }
 
 // ---- Heading-hold ----
-// While a PATH FWD/BACK step is driving, nudges the two wheels' PWM apart
-// proportionally to how far currentHeadingDeg has drifted from where it was
-// when the step started, to counter motor/friction asymmetry and drive
-// straighter over a long step.
+// While driving straight, nudges the two wheels' PWM apart proportionally to
+// how far currentHeadingDeg has drifted from holdHeadingDeg, to counter
+// motor/friction asymmetry and keep the line.
+//
+// Which way to nudge is derived from the motor functions, not assumed:
+// a positive correction runs the right wheel faster than the left. Going
+// forward that rotates the robot the same way right() does (right() drives
+// the right wheel forward and the left one back), so it moves the heading by
+// gyroRightSign. Reversing, both wheels run backwards and the same PWM split
+// rotates the robot the *other* way - so the sign flips for BACK. (The old
+// version used one sign for both, which made BACK steps amplify drift.)
+void applyHeadingHold(double holdHeadingDeg, bool reversing) {
+  if (!HEADING_HOLD_ENABLED || !mpuReady || gyroRightSign == 0) return;
+
+  double error = currentHeadingDeg - holdHeadingDeg;
+  int headingSignOfPositiveCorrection = reversing ? -gyroRightSign : gyroRightSign;
+  // Steer to move the heading opposite to the error.
+  int correction = (int)constrain(-error * fabs(HEADING_KP) * headingSignOfPositiveCorrection,
+                                  -HEADING_MAX_CORRECTION, HEADING_MAX_CORRECTION);
+
+  analogWrite(PWM_LEFT, constrain(speed - correction, 0, 255));
+  analogWrite(PWM_RIGHT, constrain(speed + correction, 0, 255));
+}
+
+// PATH FWD/BACK steps hold the heading they started on.
 void maintainHeadingHold() {
-  if (!HEADING_HOLD_ENABLED || !mpuReady) return;
   PathAction action = pathActions[pathStepIndex];
   if (action != PATH_FWD && action != PATH_BACK) return;
+  applyHeadingHold(pathStepStartHeadingDeg, action == PATH_BACK);
+}
 
-  double error = currentHeadingDeg - pathStepStartHeadingDeg;
-  int correction = (int)constrain(error * HEADING_KP, -HEADING_MAX_CORRECTION, HEADING_MAX_CORRECTION);
+// ---- Manual drive segments ----
+// Called for every manual drive command (and by the dead-man's switch). A
+// repeat of the held button is ignored; a real change closes the previous
+// segment and opens the next one at the current heading.
+void setManualMotion(ManualMotion next) {
+  if (next == manualMotion) return;
+  endManualSegment();
+  manualMotion = next;
+  manualSegStartHeadingDeg = currentHeadingDeg;
+}
 
-  int leftPWM  = constrain(speed - correction, 0, 255);
-  int rightPWM = constrain(speed + correction, 0, 255);
-  analogWrite(PWM_LEFT, leftPWM);
-  analogWrite(PWM_RIGHT, rightPWM);
+// A manual turn just ended: learn the gyro sign from it (the same way PATH
+// turns do), and tell the dashboard how far it really rotated. Measured at
+// motor-off, matching how a TURNL/TURNR step decides when to stop, so a
+// recorded turn plays back to the same angle.
+void endManualSegment() {
+  if (manualMotion != MM_LEFT && manualMotion != MM_RIGHT) return;
+  double deltaDeg = currentHeadingDeg - manualSegStartHeadingDeg;
+  learnGyroSign(deltaDeg, manualMotion == MM_RIGHT);
+  if (!mpuReady) return;  // no gyro: the recorder keeps the timed step
+  Serial.print(manualMotion == MM_RIGHT ? "MTURN:R," : "MTURN:L,");
+  Serial.println(fabs(deltaDeg), 1);
+}
+
+// Leaving manual mode for any reason (STOP, a PATH starting) must still close
+// a turn that was in progress, or its MTURN report would be lost.
+void leaveManualMode() {
+  if (manualMode) setManualMotion(MM_STOP);
+  manualMode = false;
+}
+
+// ---- Live heading stream ----
+void reportHeading() {
+  if (!mpuReady) return;
+  if (millis() - lastHeadingReportMs < HEADING_REPORT_MS) return;
+  lastHeadingReportMs = millis();
+  Serial.print("HDG:");
+  Serial.print(currentHeadingDeg, 1);
+  Serial.print(",");
+  Serial.print(gyroRightSign);
+  Serial.print(",");
+  Serial.println(anchorHeadingDeg, 1);
+}
+
+// ---- Absolute heading alignment ----
+// Wrap to (-180, 180] so "turn to face X" always takes the short way round:
+// an error of 350 degrees is really 10 degrees the other way.
+double normalizeDeg180(double deg) {
+  while (deg > 180.0) deg -= 360.0;
+  while (deg <= -180.0) deg += 360.0;
+  return deg;
+}
+
+double alignErrorDeg() {
+  return normalizeDeg180(alignTargetDeg - currentHeadingDeg);
+}
+
+// Record which way right() moves the heading, from a turn the robot just
+// made. Called with the rotation observed across a completed TURNL/TURNR
+// step, or mid-ALIGN once it has spun far enough to be sure.
+void learnGyroSign(double deltaDeg, bool wasTurningRight) {
+  if (fabs(deltaDeg) < GYRO_SIGN_LEARN_DEG) return;
+  int signOfDelta = (deltaDeg > 0) ? 1 : -1;
+  gyroRightSign = wasTurningRight ? signOfDelta : -signOfDelta;
+}
+
+// Drives an active ALIGN step, re-evaluated every loop() iteration (unlike
+// the other actions, which are set once in applyPathAction and left alone) -
+// the required direction can only be known while the error is being watched.
+void maintainAlign() {
+  if (!pathRunning || pathPaused) return;
+  if (pathActions[pathStepIndex] != PATH_ALIGN) return;
+  if (!mpuReady) return;  // no gyro: updatePath ends the step on its timeout
+
+  if (gyroRightSign == 0) {
+    // Sign unknown: spin right() and watch. Worst case this is the wrong
+    // way by GYRO_SIGN_LEARN_DEG, which the aligning below then corrects.
+    learnGyroSign(currentHeadingDeg - pathStepStartHeadingDeg, true);
+    right();
+    return;
+  }
+
+  double error = alignErrorDeg();
+  if (fabs(error) <= ALIGN_TOLERANCE_DEG) {
+    stopBot();  // updatePath sees the same condition and advances the step
+    return;
+  }
+  // error > 0 means the heading must increase to reach the target.
+  bool spinRight = (error > 0) == (gyroRightSign > 0);
+  if (spinRight) right();
+  else left();
 }
 
 // ---- Path playback ----
 void applyPathAction(PathAction action) {
+  if (action == PATH_ALIGN) {
+    // Target is relative to the anchor, not to wherever this step begins -
+    // that's the whole point: it's an absolute heading, so accumulated error
+    // from every step before it gets corrected here rather than carried on.
+    alignTargetDeg = anchorHeadingDeg + (double)pathDurations[pathStepIndex];
+    stopBot();  // maintainAlign() takes over from the next iteration
+    return;
+  }
   switch (action) {
     case PATH_FWD:         forward();    break;
     case PATH_BACK:         reverseBot(); break;
@@ -334,6 +505,7 @@ void startPath(String body) {
       else if (actionStr == "RIGHT") action = PATH_RIGHT;
       else if (actionStr == "TURNL") action = PATH_TURN_LEFT;
       else if (actionStr == "TURNR") action = PATH_TURN_RIGHT;
+      else if (actionStr == "ALIGN") action = PATH_ALIGN;
       else action = PATH_HOLD;  // "HOLD" or anything unrecognized
       pathActions[pathStepCount] = action;
       pathDurations[pathStepCount] = (unsigned long)max(0L, value);
@@ -349,7 +521,7 @@ void startPath(String body) {
   }
 
   // Path mode is mutually exclusive with manual takeover.
-  manualMode = false;
+  leaveManualMode();
   pathRunning = true;
   pathStepIndex = 0;
   pathStepStartTime = millis();
@@ -365,18 +537,34 @@ void startPath(String body) {
 void updatePath() {
   PathAction action = pathActions[pathStepIndex];
   bool isTurn = (action == PATH_TURN_LEFT || action == PATH_TURN_RIGHT);
+  bool isAlign = (action == PATH_ALIGN);
   unsigned long elapsed = millis() - pathStepStartTime;
 
   bool stepDone;
   if (isTurn) {
     double turnedDeg = fabs(currentHeadingDeg - pathStepStartHeadingDeg);
     stepDone = (turnedDeg >= (double)pathDurations[pathStepIndex]) || (elapsed >= PATH_TURN_TIMEOUT_MS);
+  } else if (isAlign) {
+    // maintainAlign() is doing the steering; this only decides when to move on.
+    stepDone = (mpuReady && fabs(alignErrorDeg()) <= ALIGN_TOLERANCE_DEG)
+               || (elapsed >= ALIGN_TIMEOUT_MS);
   } else {
     stepDone = (elapsed >= pathDurations[pathStepIndex]);
   }
   if (!stepDone) return;
 
-  if (isTurn) stopBot();  // brief brake to arrest rotation before continuing
+  if (isTurn || action == PATH_LEFT || action == PATH_RIGHT) {
+    // A deliberate turn of known direction is the one moment the gyro's sign
+    // convention is observable for free - remember it for ALIGN steps and
+    // heading-hold. Timed LEFT/RIGHT count too (older recorded paths).
+    learnGyroSign(currentHeadingDeg - pathStepStartHeadingDeg,
+                  action == PATH_TURN_RIGHT || action == PATH_RIGHT);
+  }
+  if (isTurn || isAlign) stopBot();  // brief brake to arrest rotation before continuing
+  if (isAlign) {
+    Serial.print("ALIGN:");
+    Serial.println(alignErrorDeg(), 1);  // residual error - 0 +/- tolerance when it worked
+  }
 
   pathStepIndex++;
   if (pathStepIndex >= pathStepCount) {
@@ -398,16 +586,19 @@ void updatePath() {
 //   STOP
 //   MANUAL, MFWD, MBACK, MLEFT, MRIGHT, MSTOP  (phone/manual takeover)
 //   PATH:<steps>, PATH_STOP, PATH_PAUSE, PATH_RESUME  (scripted path playback)
-//   HEADING_RESET, GYRO  (MPU6050 diagnostics)
+//   HEADING_RESET, HEADING_ANCHOR, GYRO  (MPU6050 heading)
+// and pushes, unprompted: HDG:<deg>,<sign>,<anchor> at 10 Hz (gyro dial),
+// MTURN:<L|R>,<deg> when a manual turn ends (gyro-measured recording).
 //   FOOD  (IR food-tray sensor state)
 void processCommand(String cmd) {
   cmd.trim();
 
   if (cmd == "STOP") {
-    manualMode = false;
+    leaveManualMode();
     stopPath();  // also stops the motors
     Serial.println("OK:STOPPED");
   } else if (cmd == "MANUAL") {
+    setManualMotion(MM_STOP);  // a re-sent MANUAL mid-turn still reports that turn
     manualMode = true;
     stopPath();  // also stops the motors
     lastManualCmdTime = millis();
@@ -440,11 +631,13 @@ void processCommand(String cmd) {
       Serial.println("ERR:NOT_MANUAL");
     } else {
       lastManualCmdTime = millis();
-      if (cmd == "MFWD") forward();
-      else if (cmd == "MBACK") reverseBot();
-      else if (cmd == "MLEFT") left();
-      else if (cmd == "MRIGHT") right();
-      else stopBot();  // MSTOP
+      // Segment first, motors second: the turn that's ending is measured
+      // before its motors are switched off/over.
+      if (cmd == "MFWD")        { setManualMotion(MM_FWD);   forward(); }
+      else if (cmd == "MBACK")  { setManualMotion(MM_BACK);  reverseBot(); }
+      else if (cmd == "MLEFT")  { setManualMotion(MM_LEFT);  left(); }
+      else if (cmd == "MRIGHT") { setManualMotion(MM_RIGHT); right(); }
+      else                      { setManualMotion(MM_STOP);  stopBot(); }  // MSTOP
       Serial.print("OK:");
       Serial.println(cmd);
     }
@@ -452,8 +645,17 @@ void processCommand(String cmd) {
     // Diagnostic / resync: the dashboard asks once on connect so it knows
     // the tray state without waiting for the next transition.
     Serial.println(foodPresent ? "FOOD:PRESENT" : "FOOD:ABSENT");
+  } else if (cmd == "HEADING_ANCHOR") {
+    // Latch the current heading as the route's absolute reference. Sent by
+    // the dashboard when a delivery starts; the return trip's ALIGN,0 step
+    // then brings the robot back to exactly this heading.
+    anchorHeadingDeg = currentHeadingDeg;
+    Serial.print("OK:HEADING_ANCHOR:");
+    Serial.println(anchorHeadingDeg, 1);
   } else if (cmd == "HEADING_RESET") {
     currentHeadingDeg = 0.0;
+    anchorHeadingDeg = 0.0;  // the anchor is a heading too - zeroing one without
+                              // the other would silently offset every ALIGN step
     Serial.println("OK:HEADING_RESET");
   } else if (cmd == "GYRO") {
     // Diagnostic: check MPU6050 wiring/sign on real hardware. Rotate the
@@ -513,16 +715,22 @@ void loop() {
   // Always listen for dashboard commands, even while idle.
   handleSerial();
 
-  // Both run unconditionally - heading tracking must never miss rotation,
-  // and the tray is emptied while the robot is parked at the table.
+  // All run unconditionally - heading tracking must never miss rotation,
+  // the tray is emptied while the robot is parked at the table, and the
+  // dashboard's gyro dial should move even when the robot is turned by hand.
   updateHeading();
   updateFoodSensor();
+  reportHeading();
 
   if (manualMode) {
-    // Motors are driven directly by MFWD/MBACK/MLEFT/MRIGHT above; this is
-    // just the dead-man's switch in case the phone/dashboard goes quiet.
-    if (millis() - lastManualCmdTime > MANUAL_TIMEOUT_MS) {
+    // Motors are driven directly by MFWD/MBACK/MLEFT/MRIGHT above. Here:
+    // the dead-man's switch in case the phone/dashboard goes quiet, and
+    // keeping a held forward/back straight.
+    if (manualMotion != MM_STOP && millis() - lastManualCmdTime > MANUAL_TIMEOUT_MS) {
+      setManualMotion(MM_STOP);  // closes (and reports) a turn cut off by the timeout
       stopBot();
+    } else if (manualMotion == MM_FWD || manualMotion == MM_BACK) {
+      applyHeadingHold(manualSegStartHeadingDeg, manualMotion == MM_BACK);
     }
     return;
   }
@@ -530,6 +738,7 @@ void loop() {
   if (pathRunning) {
     if (!pathPaused) {
       maintainHeadingHold();  // no-op unless the active step is FWD/BACK
+      maintainAlign();        // no-op unless the active step is ALIGN
       updatePath();           // paused: motors already off, hold position in the step sequence
     }
     return;

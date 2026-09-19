@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Compile lineflow.ino and upload it to the Teensy plugged into this Pi.
 #
-#   ./flash_teensy.sh                          detect the board, build, upload
-#   TEENSY_FQBN=teensy:avr:teensy41 ./flash_teensy.sh   skip detection
+#   ./flash_teensy.sh                          build + upload (Teensy 4.1)
+#   TEENSY_FQBN=teensy:avr:teensy40 ./flash_teensy.sh   a different board
 #
 # One-time prerequisite: ./setup_teensy_flash.sh
 #
@@ -34,11 +34,14 @@ PORT=""
 [ -n "$PORT_LINK" ] && PORT="$(readlink -f "$PORT_LINK")"
 
 # ---- Which Teensy? ----
-# Ask the board itself (the Teensy core's discovery reports the exact model)
-# rather than hard-coding one: flashing a 4.1 image onto a 4.0 fails.
+# The robot's board is a Teensy 4.1. Still ask the connected board (the
+# Teensy core's discovery reports the exact model) and believe it if it
+# answers - flashing a 4.1 image onto anything else fails - but fall back to
+# 4.1 when it can't say (blank, crashed, or sitting in the bootloader).
+ROBOT_FQBN="teensy:avr:teensy41"
 FQBN="${TEENSY_FQBN:-}"
 if [ -z "$FQBN" ]; then
-    FQBN="$(arduino-cli board list --format json 2>/dev/null | python3 -c '
+    DETECTED="$(arduino-cli board list --format json 2>/dev/null | python3 -c '
 import json, sys
 try:
     data = json.load(sys.stdin)
@@ -52,12 +55,16 @@ for port in ports:
             print(board["fqbn"])
             sys.exit()
 ' || true)"
-fi
-if [ -z "$FQBN" ]; then
-    die "Couldn't detect the Teensy model (is it plugged in and running a sketch?).
-       Name it yourself, e.g.:
-         TEENSY_FQBN=teensy:avr:teensy41 ./flash_teensy.sh
-       Models: teensy41, teensy40, teensyMM, teensy36, teensy35, teensy31 (3.1/3.2), teensyLC"
+    if [ -z "$DETECTED" ]; then
+        FQBN="$ROBOT_FQBN"
+        echo "Couldn't ask the board its model - assuming the robot's Teensy 4.1."
+    elif [ "$DETECTED" != "$ROBOT_FQBN" ]; then
+        FQBN="$DETECTED"
+        echo "WARNING: the connected board reports $DETECTED, not the robot's Teensy 4.1."
+        echo "         Building for what's actually plugged in."
+    else
+        FQBN="$DETECTED"
+    fi
 fi
 
 # The same board under teensy_loader_cli's name for it.

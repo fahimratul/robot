@@ -4,3 +4,4 @@ saved_paths.json
 dashboard.log
 dashboard.log.1
 venv/
+.build/

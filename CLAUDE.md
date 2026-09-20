@@ -13,10 +13,30 @@ drift from the code.
   always runs at full USB speed. Its pins are **3.3V only, not 5V
   tolerant**, which is why every sensor here is powered from 3.3V.
 - **Motor driver**: Cytron MDD10A, PWM+DIR per side.
+- **Pi**: Raspberry Pi 5 running **Ubuntu** (kernel `6.8.0-*-raspi`), not
+  Raspberry Pi OS — so no `raspi-config`; `vcgencmd` needs `sudo` (or the
+  `video` group). USB devices at boot: the Teensy (`16c0:0483`,
+  `ttyACM0`), the LiDAR's CP2102N (`10c4:ea60`, `ttyUSB0`), and the
+  **Waveshare WS170120 7" touchscreen** (`0eef:0005`, USB touch — and likely
+  USB power for its backlight too).
+- **Power — known problem (2026-09-20)**: the supply was forced to "5A" (the
+  Pi can't detect that itself from a non-PD source), which lifts the Pi's
+  600mA USB limit. Measured **`EXT5V_V` ≈ 4.62–4.67V at idle** with
+  `throttled=0x50005` (undervolting *and* throttling right now) and
+  `Undervoltage detected!` in `dmesg` 9s after boot — *before* the LiDAR is
+  started. The Pi powers off when the LiDAR's motor spins up. Needs ~5.1V
+  under load. Check with
+  `sudo vcgencmd pmic_read_adc EXT5V_V; sudo vcgencmd get_throttled`.
 - **LiDAR**: RPLidar C1, plugged into the **Pi** directly (its own serial
   port, not through the Teensy), read by `dashbord.py` via the `rplidarc1`
   package.
-- **MPU6050** (added 2026-09-18): I2C gyro/accel breakout (GY-521 style),
+- **MPU6050** (added 2026-09-18; detection widened 2026-09-20): probed at
+  **0x68 and 0x69** (breakouts that tie AD0 high use 0x69), and **any**
+  WHO_AM_I that isn't 0x00/0xFF is accepted — "MPU6050" modules are often
+  MPU6500/9250 clones reporting 0x70/0x72/0x73, whose gyro registers are
+  identical. Refusing on WHO_AM_I != 0x68 (the pre-2026-09-20 check) is a
+  likely cause of a "gyro not detected" that is actually wired fine.
+  I2C gyro/accel breakout (GY-521 style),
   read on the Teensy via a minimal raw-I2C driver in `lineflow.ino` (no
   extra Arduino library). Only the Z-axis gyro is used, for heading — see
   "Heading (MPU6050 gyro)" below. **Not** a wheel-encoder replacement: it
@@ -58,6 +78,11 @@ are free.
   covering the desktop taskbar and title bar); the header's "Exit full
   screen" button is the touch way out since there's no close button (Esc /
   F11 too), and `DASHBOARD_WINDOWED=1` starts windowed for PC development.
+  **No text typing outside Save As**: both Spinboxes are `state="readonly"`
+  (arrows still work), because a focused text field pops the touchscreen's
+  on-screen keyboard up over the dashboard. A **Gyro test** button in the
+  ROBOT LINK row sends `GYRO` + `I2CSCAN` and jumps to the LOG tab — the
+  robot has no keyboard, so that button is the only way to run those.
   Save As drops out of fullscreen while its name dialog is open — it's the
   only typed input, and a fullscreen window can cover the on-screen keyboard
   or hide the dialog behind itself. The CONTROL tab is tight at 800x480:
@@ -84,7 +109,9 @@ are free.
   `~/.config/autostart/mist-cafe-bot.desktop` so the desktop session launches
   `start_dashboard.sh`. XDG autostart rather than a systemd service because
   the dashboard is a Tkinter window and must start inside the logged-in
-  session; needs "Desktop Autologin" in `raspi-config`. `--remove` undoes it.
+  session; needs automatic desktop login (the Pi runs **Ubuntu**: Settings
+  → System → Users → Automatic Login — there is no `raspi-config`).
+  `--remove` undoes it.
 - `setup_teensy_flash.sh` — one-time: installs `arduino-cli` (to
   `~/.local/bin`) + PJRC's `teensy:avr` core, builds `teensy_loader_cli`
   from PJRC's source (older apt builds predate Teensy 4.x), installs PJRC's
@@ -144,9 +171,15 @@ Plain text, newline-terminated, replies are `OK:...` / `ERR:...`:
 - `HEADING_RESET` — zero `currentHeadingDeg` **and** `anchorHeadingDeg` →
   `OK:HEADING_RESET` (zeroing one without the other would silently offset
   every later `ALIGN`)
-- `GYRO` — diagnostic → `GYRO:<OK|NOT_FOUND>,<currentHeadingDeg>`; use to
-  verify the MPU6050 is wired/detected and that the value changes sensibly
-  when the chassis is rotated by hand
+- `GYRO` — diagnostic →
+  `GYRO:<OK|NOT_FOUND>,<currentHeadingDeg>,ADDR=0x<addr>,WHOAMI=0x<id>,SIGN=<-1|0|1>`
+  (first two fields unchanged from before 2026-09-20); use to verify the
+  MPU6050 is wired/detected and that the value changes sensibly when the
+  chassis is rotated by hand
+- `I2CSCAN` — diagnostic → one `I2C:0x<addr>` line per device answering on
+  the bus, then `I2C:DONE:<count>`. Nothing found = wiring/power; something
+  at 0x68 or 0x69 = wired fine. Also printed automatically after
+  `ERR:MPU6050_NOT_FOUND` at boot.
 - Robot → Pi: `READY` on boot (followed by the initial `FOOD:PRESENT`/
   `FOOD:ABSENT`), the unsolicited tray events `FOOD:PRESENT` / `FOOD:TAKEN`
   (see below), plus the `OK:...`/`ERR:...` replies above, and two

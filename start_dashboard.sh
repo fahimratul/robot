@@ -31,7 +31,8 @@ log "=== start_dashboard.sh — $ROOT ==="
 # nothing to draw into and it would crash on import.
 if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
     log "ERROR: no DISPLAY/WAYLAND_DISPLAY - the dashboard needs a desktop session."
-    log "       If the Pi boots to a console, run 'sudo raspi-config' ->"
+    log "       Turn on automatic login to the desktop - Ubuntu: Settings -> System"
+    log "       -> Users -> Automatic Login. Raspberry Pi OS: sudo raspi-config ->"
     log "       System Options -> Boot / Auto Login -> Desktop Autologin."
     exit 1
 fi

@@ -886,6 +886,10 @@ class RobotDashboard:
         style.configure("TSpinbox", fieldbackground=BG_PANEL, background=BG_PANEL_ALT,
                          foreground=FG_TEXT, arrowcolor=FG_TEXT, bordercolor=ACCENT_DIM,
                          insertcolor=FG_TEXT)
+        # The spinboxes are readonly (no on-screen keyboard) - keep them looking
+        # normal rather than greyed out like a disabled widget.
+        style.map("TSpinbox", fieldbackground=[("readonly", BG_PANEL)],
+                   foreground=[("readonly", FG_TEXT)])
 
         style.configure("TNotebook", background=BG_MAIN, borderwidth=0)
         style.configure("TNotebook.Tab", background=BG_PANEL_ALT, foreground=FG_DIM,
@@ -968,6 +972,7 @@ class RobotDashboard:
         notebook.add(saved_tab, text="◆ SAVED")
         notebook.add(lidar_tab, text="◆ LIDAR MAP")
         notebook.add(log_tab, text="◆ LOG")
+        self.log_tab = log_tab  # _gyro_test jumps here to show the replies
 
         # ===== TAB 1: Robot control =====
         conn_frame = ttk.LabelFrame(control_tab, text="◆ ROBOT LINK (TEENSY)")
@@ -982,6 +987,8 @@ class RobotDashboard:
         self.conn_status = ttk.Label(conn_frame, text="● DISCONNECTED", foreground=DANGER,
                                       font=FONT_STATUS)
         self.conn_status.grid(row=0, column=3, padx=6)
+        ttk.Button(conn_frame, text="Gyro test", style="Small.TButton",
+                   command=self._gyro_test).grid(row=0, column=4, padx=6)
 
         self.phone_url_label = ttk.Label(conn_frame, text="Phone remote: starting...",
                                           font=("Consolas", 8), foreground=FG_DIM,
@@ -1081,8 +1088,13 @@ class RobotDashboard:
         path_action_combo.bind("<<ComboboxSelected>>", self._on_path_action_changed)
         ttk.Label(builder_frame, text="for").grid(row=0, column=1)
         self.path_duration_var = tk.StringVar(value="3")
+        # readonly: the arrows still work, but tapping the box can't put a text
+        # cursor in it - which is what pops the touchscreen's on-screen keyboard
+        # up over the dashboard. Naming a saved path is the only place typing is
+        # actually wanted, and that dialog still gets the keyboard.
         self.path_duration_spin = ttk.Spinbox(builder_frame, from_=0.5, to=120, increment=0.5,
-                                               width=6, textvariable=self.path_duration_var)
+                                               width=6, textvariable=self.path_duration_var,
+                                               state="readonly")
         self.path_duration_spin.grid(row=0, column=2, padx=6)
         self.path_unit_label = ttk.Label(builder_frame, text="sec")
         self.path_unit_label.grid(row=0, column=3)
@@ -1166,7 +1178,8 @@ class RobotDashboard:
 
         ttk.Label(lidar_conn_frame, text="Obstacle (mm):").grid(row=0, column=3, padx=(12, 4))
         ttk.Spinbox(lidar_conn_frame, from_=100, to=4000, increment=50, width=6,
-                    textvariable=self.obstacle_threshold_mm).grid(row=0, column=4, padx=4)
+                    textvariable=self.obstacle_threshold_mm,
+                    state="readonly").grid(row=0, column=4, padx=4)  # see path_duration_spin
 
         status_row = ttk.Frame(lidar_tab)
         status_row.pack(fill="x", padx=6)
@@ -1834,6 +1847,26 @@ class RobotDashboard:
             return
         self._last_hdg_time = time.time()
         self._draw_heading_dial()
+
+    def _gyro_test(self):
+        """Ask the Teensy what it can see on the I2C bus, and show the answer.
+
+        There's no keyboard on the robot, so this is the only way to run the
+        GYRO/I2CSCAN diagnostics. Jumps to the LOG tab because that's where
+        the replies land.
+        """
+        if not (self.ser and self.ser.is_open):
+            self._log("Connect to the robot first.")
+            return
+        self._log("--- Gyro test: GYRO expects OK; I2C expects a device at 0x68 or 0x69 ---")
+        if self.heading_deg is None:
+            self._log("No HDG stream: the Teensy isn't reporting a heading (gyro not detected).")
+        else:
+            self._log(f"HDG stream is live - heading {self.heading_deg:+.1f}°, "
+                      f"{'direction learned' if self.gyro_right_sign else 'turn once to calibrate'}.")
+        self._send("GYRO")
+        self._send("I2CSCAN")
+        self.notebook.select(self.log_tab)
 
     def _heading_from_start(self):
         """Degrees turned from START (the anchor), right turns positive, or

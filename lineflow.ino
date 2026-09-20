@@ -49,8 +49,11 @@ bool          foodPresent = false;       // debounced tray state
 bool          foodRawLast = false;       // last raw read, for debounce timing
 unsigned long foodRawChangeTime = 0;
 
-int speed      = 90;    // normal drive speed
-int nudgeSpeed = 85;    // slow-side speed while turning
+int speed        = 90;    // normal forward drive speed
+int nudgeSpeed   = 85;    // slow-side speed while turning
+int reverseSpeed = 110;   // reverseBot()/left()/right() run harder than forward -
+                          // heading-hold has to steer around the same number or it
+                          // would quietly slow reversing down to `speed`
 
 // ---- Manual drive (phone/dashboard takeover) ----
 // manualMode -> true after a "MANUAL" command; MFWD/MBACK/MLEFT/MRIGHT drive
@@ -105,7 +108,9 @@ String inputBuffer = "";
 #define MPU_ADDR 0x68
 const double GYRO_SENS_LSB_PER_DPS = 131.0;  // datasheet value for +-250 deg/s (GYRO_CONFIG=0x00)
 
-bool   mpuReady = false;
+bool    mpuReady = false;
+uint8_t mpuAddr = MPU_ADDR;   // 0x68, or 0x69 when the breakout ties AD0 high
+uint8_t mpuWhoAmI = 0x00;     // what the chip reported - clones aren't 0x68
 double currentHeadingDeg = 0.0;      // free-running integrated yaw; drifts slowly over minutes,
                                       // fine for single turns/steps that only last a few seconds
 double gyroZBiasDegPerSec = 0.0;     // measured once at boot while stationary
@@ -225,42 +230,83 @@ void stopBot() {
 void reverseBot() {
   digitalWrite(DIR_LEFT, LOW);
   digitalWrite(DIR_RIGHT, LOW);
-  analogWrite(PWM_LEFT, 110);
-  analogWrite(PWM_RIGHT, 110);
+  analogWrite(PWM_LEFT, reverseSpeed);
+  analogWrite(PWM_RIGHT, reverseSpeed);
 }
 
 // ---- MPU6050 gyro ----
 void mpuWrite(uint8_t reg, uint8_t val) {
-  Wire.beginTransmission(MPU_ADDR);
+  Wire.beginTransmission(mpuAddr);
   Wire.write(reg);
   Wire.write(val);
   Wire.endTransmission();
 }
 
 int16_t mpuReadGyroZRaw() {
-  Wire.beginTransmission(MPU_ADDR);
+  Wire.beginTransmission(mpuAddr);
   Wire.write(0x47);  // GYRO_ZOUT_H
   Wire.endTransmission(false);
-  Wire.requestFrom(MPU_ADDR, 2);
+  Wire.requestFrom(mpuAddr, 2);
   if (Wire.available() < 2) return 0;
   int16_t raw = (Wire.read() << 8);
   raw |= Wire.read();
   return raw;
 }
 
+// WHO_AM_I at the given address, or 0x00/0xFF when nothing answers.
+uint8_t mpuReadWhoAmI(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  Wire.write(0x75);  // WHO_AM_I
+  if (Wire.endTransmission(false) != 0) return 0x00;  // nobody acknowledged
+  Wire.requestFrom(addr, 1);
+  return Wire.available() ? Wire.read() : 0x00;
+}
+
+// Print every device answering on the bus - the quickest way to tell "wired
+// wrong / not powered" (nothing found) from "wired fine, unexpected chip"
+// (something found at 0x68 or 0x69).
+void i2cScan() {
+  int found = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.print("I2C:0x");
+      Serial.println(addr, HEX);
+      found++;
+    }
+  }
+  Serial.print("I2C:DONE:");
+  Serial.println(found);
+}
+
 void setupMPU() {
   Wire.begin();
+  mpuReady = false;  // re-probing must be able to conclude "gone", not keep a stale yes
 
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x75);  // WHO_AM_I
-  Wire.endTransmission(false);
-  Wire.requestFrom(MPU_ADDR, 1);
-  uint8_t whoAmI = Wire.available() ? Wire.read() : 0x00;
-  mpuReady = (whoAmI == 0x68);
+  // Try both addresses: AD0 low is 0x68, but plenty of breakouts tie AD0
+  // high (0x69), and a genuine MPU6050 answers 0x68 to WHO_AM_I while
+  // MPU6500/9250-based clones sold as "MPU6050" answer 0x70/0x72/0x73.
+  // Their gyro registers are identical, so accept any chip that answers
+  // rather than refusing to run on the WHO_AM_I value alone.
+  const uint8_t addresses[] = {0x68, 0x69};
+  for (uint8_t i = 0; i < 2; i++) {
+    uint8_t who = mpuReadWhoAmI(addresses[i]);
+    if (who != 0x00 && who != 0xFF) {
+      mpuAddr = addresses[i];
+      mpuWhoAmI = who;
+      mpuReady = true;
+      break;
+    }
+  }
   if (!mpuReady) {
     Serial.println("ERR:MPU6050_NOT_FOUND");
+    i2cScan();  // so the log says whether anything is on the bus at all
     return;
   }
+  Serial.print("OK:MPU:ADDR=0x");
+  Serial.print(mpuAddr, HEX);
+  Serial.print(",WHOAMI=0x");
+  Serial.println(mpuWhoAmI, HEX);
 
   mpuWrite(0x6B, 0x00);  // PWR_MGMT_1: wake up (default power-on state is asleep)
   mpuWrite(0x1B, 0x00);  // GYRO_CONFIG: +-250 deg/s range, 131 LSB/(deg/s)
@@ -338,8 +384,9 @@ void applyHeadingHold(double holdHeadingDeg, bool reversing) {
   int correction = (int)constrain(-error * fabs(HEADING_KP) * headingSignOfPositiveCorrection,
                                   -HEADING_MAX_CORRECTION, HEADING_MAX_CORRECTION);
 
-  analogWrite(PWM_LEFT, constrain(speed - correction, 0, 255));
-  analogWrite(PWM_RIGHT, constrain(speed + correction, 0, 255));
+  int base = reversing ? reverseSpeed : speed;  // keep the tuned speed for this direction
+  analogWrite(PWM_LEFT, constrain(base - correction, 0, 255));
+  analogWrite(PWM_RIGHT, constrain(base + correction, 0, 255));
 }
 
 // PATH FWD/BACK steps hold the heading they started on.
@@ -664,7 +711,16 @@ void processCommand(String cmd) {
     Serial.print("GYRO:");
     Serial.print(mpuReady ? "OK" : "NOT_FOUND");
     Serial.print(",");
-    Serial.println(currentHeadingDeg, 1);
+    Serial.print(currentHeadingDeg, 1);
+    Serial.print(",ADDR=0x");
+    Serial.print(mpuAddr, HEX);
+    Serial.print(",WHOAMI=0x");
+    Serial.print(mpuWhoAmI, HEX);
+    Serial.print(",SIGN=");
+    Serial.println(gyroRightSign);
+  } else if (cmd == "I2CSCAN") {
+    // Diagnostic: what's actually on the I2C bus right now.
+    i2cScan();
   } else if (cmd.length() > 0) {
     Serial.print("ERR:UNKNOWN_CMD:");
     Serial.println(cmd);

@@ -44,8 +44,10 @@ echo "Installed $ENTRY"
 echo "  -> runs: $ROOT/start_dashboard.sh"
 echo
 echo "The Pi must boot straight to the desktop and log in by itself, or there"
-echo "is no session to start into. Check with:"
-echo "  sudo raspi-config  ->  System Options  ->  Boot / Auto Login  ->  Desktop Autologin"
+echo "is no session to start into. Turn on automatic login:"
+echo "  Ubuntu:             Settings -> System -> Users -> Unlock -> Automatic Login: on"
+echo "  Raspberry Pi OS:    sudo raspi-config -> System Options -> Boot / Auto Login"
+echo "                      -> Desktop Autologin"
 echo
 echo "Reboot to test. If the dashboard doesn't appear, the reason is in:"
 echo "  $ROOT/dashboard.log"

@@ -855,6 +855,7 @@ class RobotDashboard:
         self._draw_direction(None)
         self._update_food_label()
         self._draw_heading_dial()
+        self._block_touch_keyboard()
         self._set_fullscreen(self.fullscreen)
         self._refresh_map()  # start the periodic canvas/obstacle-check loop
         self._start_phone_server()
@@ -938,6 +939,37 @@ class RobotDashboard:
         style.configure("Success.TButton", foreground=SUCCESS)
         style.configure("Danger.TButton", foreground=DANGER)
         style.configure("Accent.TButton", foreground=ACCENT)
+
+    # Widget classes that count as "text input" - focusing one of these is
+    # what makes GNOME slide the on-screen keyboard up over the dashboard on
+    # a touchscreen, even with screen-keyboard-enabled set to false.
+    _TEXT_WIDGETS = (tk.Entry, ttk.Entry, tk.Spinbox, ttk.Spinbox, tk.Text)
+
+    def _block_touch_keyboard(self):
+        """Stop anything in the main window taking keyboard focus.
+
+        Nothing here needs typing (spinboxes are readonly, Save As pre-fills a
+        name), so refusing focus costs nothing and keeps the on-screen keyboard
+        down. Dialogs are separate toplevels and are left alone - the Save As
+        name box must still work when a keyboard is available.
+        """
+        def strip(widget):
+            for child in widget.winfo_children():
+                try:
+                    child.configure(takefocus=0)
+                except tk.TclError:
+                    pass  # not every widget has the option
+                strip(child)
+
+        strip(self.root)
+        self.root.bind_all("<FocusIn>", self._refuse_text_focus, add="+")
+
+    def _refuse_text_focus(self, event):
+        widget = event.widget
+        if widget.winfo_toplevel() is not self.root:
+            return  # a dialog - typing there is deliberate
+        if isinstance(widget, self._TEXT_WIDGETS):
+            self.root.focus_set()
 
     def _set_fullscreen(self, on):
         self.fullscreen = on

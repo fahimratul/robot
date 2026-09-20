@@ -93,10 +93,15 @@ screw terminal and thick wire, never a dupont jumper, ideally two of them.
   **No text typing needed anywhere**: both Spinboxes are `state="readonly"`
   (arrows still work), because a focused text field pops the touchscreen's
   on-screen keyboard up over the dashboard; and Save As pre-fills the next
-  free "Path N" so it can be saved with OK alone. The robot's on-screen
-  keyboard is turned off outright
-  (`gsettings set org.gnome.desktop.a11y.applications screen-keyboard-enabled false`),
-  so nothing in the UI may *require* typing. A **Gyro test** button in the
+  free "`SAVED_PATH_NAME_PREFIX` N" (Table 1, Table 2, …) so it can be saved
+  with OK alone. On top of that, `_block_touch_keyboard()` sets
+  `takefocus=0` on every widget in the main window and bounces focus off any
+  Entry/Spinbox/Text via a `<FocusIn>` hook: GNOME raises its on-screen
+  keyboard whenever a text widget takes focus on a touchscreen, **even with**
+  `org.gnome.desktop.a11y.applications screen-keyboard-enabled false`.
+  Dialogs are separate toplevels and deliberately excluded, so Save As still
+  accepts typing when a keyboard is attached. Nothing in the UI may
+  *require* typing. A **Gyro test** button in the
   ROBOT LINK row sends `GYRO` + `I2CSCAN` and jumps to the LOG tab — the
   robot has no keyboard, so that button is the only way to run those.
   Save As drops out of fullscreen while its name dialog is open — it's the

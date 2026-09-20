@@ -150,6 +150,14 @@ Four spoken messages, all constants at the top of `dashbord.py`:
 the log as `Voice: "..."`, so the log still shows what it tried to say when
 nothing is audible.
 
+The LOG tab's **Speaker test** button says a test phrase, then reports the
+default sink (warning when it isn't the `bluez_output...` one), lists the
+sinks, and names the connected Bluetooth device — silence otherwise looks
+the same whether pyttsx3 is missing, espeak-ng won't start, the speaker has
+dropped its connection, or audio is going to HDMI. It then asks "did you
+hear it?" and prints what to check on a no. `pactl`/`bluetoothctl` run off
+the Tk thread and are treated as optional (absent on a dev PC).
+
 The speaker is **Bluetooth**, so its A2DP link sleeps when idle and swallows
 whatever is said in the ~1s it takes to wake. `VOICE_LEAD_IN` (a couple of
 commas, prepended in `SpeechWorker._run`) makes espeak emit a short silence

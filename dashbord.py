@@ -62,6 +62,8 @@ import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 from urllib.parse import urlparse
 
+import subprocess
+
 import serial
 import serial.tools.list_ports
 
@@ -85,6 +87,7 @@ except ImportError:
 VOICE_LEAD_IN = ", , "
 
 # Everything the robot says out loud, in one place (pyttsx3 -> espeak-ng).
+SPEAKER_TEST_MSG = "Speaker test. Can you hear me?"        # the Speaker test button
 OBSTACLE_VOICE_MSG = "Please give side"          # something entered the front-180 zone
 STALL_VOICE_MSG = "Robot needs help, please take control"  # still blocked after STALL_ALERT_SECONDS
 
@@ -341,6 +344,11 @@ class SpeechWorker:
         if pyttsx3 is None:
             return
         self._queue.put(text)
+
+    def ready(self):
+        """True once the engine is up - pyttsx3 missing, or espeak-ng failing
+        to start, both leave the robot silent with nothing else to show for it."""
+        return pyttsx3 is not None and self._engine is not None
 
 
 # =====================================================================
@@ -1222,6 +1230,8 @@ class RobotDashboard:
         # and this is where its output lands anyway.
         ttk.Button(dir_row, text="Pin test", style="Small.TButton",
                    command=self._pin_test).pack(side="right", padx=6)
+        ttk.Button(dir_row, text="Speaker test", style="Small.TButton",
+                   command=self._speaker_test).pack(side="right", padx=2)
 
         self.log_text = tk.Text(log_tab, height=10, state="disabled", wrap="word",
                                  bg=BG_INSET, fg=FG_TEXT, insertbackground=ACCENT,
@@ -1882,6 +1892,90 @@ class RobotDashboard:
         self._log("--- Motor test: each side, each way, ~0.6s per burst ---")
         self._send("MTEST")
         self.notebook.select(self.log_tab)
+
+    # ---------------- Speaker / Bluetooth test ----------------
+    def _speaker_test(self):
+        """Say a test phrase and report where the audio is actually going.
+
+        Silence has several causes that look identical from the robot: no
+        pyttsx3, espeak-ng not starting, the Bluetooth speaker disconnected,
+        or the default sink pointing at HDMI instead of the speaker. This
+        separates them, then asks whether it was actually heard.
+        """
+        self._log("--- Speaker test ---")
+        if pyttsx3 is None:
+            self._log("✗ pyttsx3 isn't installed - the robot can't speak at all. Fix with:")
+            self._log("    cd ~/robot && source venv/bin/activate && pip install pyttsx3")
+        elif not self.speech.ready():
+            self._log("✗ The voice engine didn't start (espeak-ng missing?). Try: "
+                      "sudo apt install espeak-ng")
+        else:
+            self._log(f'Speaking: "{SPEAKER_TEST_MSG}"')
+            self.speech.speak(SPEAKER_TEST_MSG)
+            self.root.after(4000, self._speaker_test_followup)
+        # pactl/bluetoothctl can block for a moment - keep them off the UI thread.
+        threading.Thread(target=self._collect_audio_info, daemon=True).start()
+        self.notebook.select(self.log_tab)
+
+    @staticmethod
+    def _run_cmd(args):
+        try:
+            done = subprocess.run(args, capture_output=True, text=True, timeout=5)
+            return done.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return None  # tool missing (e.g. developing on Windows), or it hung
+
+    def _collect_audio_info(self):
+        """Runs off the Tk thread; results are handed back to it to log."""
+        lines = []
+
+        info = self._run_cmd(["pactl", "info"])
+        if info is None:
+            lines.append("· Couldn't run pactl - can't tell which audio device is in use.")
+        else:
+            sink = next((l.split(":", 1)[1].strip() for l in info.splitlines()
+                         if l.startswith("Default Sink:")), "")
+            if "bluez" in sink.lower():
+                lines.append(f"✓ Audio is going to the Bluetooth speaker ({sink}).")
+            elif sink:
+                lines.append(f"⚠ Audio is going to {sink} - that is NOT the Bluetooth speaker.")
+                lines.append("    Fix: pactl list short sinks   then   pactl set-default-sink <bluez_...>")
+            else:
+                lines.append("⚠ No default audio sink - nothing will be heard.")
+
+        sinks = self._run_cmd(["pactl", "list", "short", "sinks"])
+        if sinks:
+            for line in sinks.splitlines():
+                lines.append(f"    sink: {line.split()[1] if len(line.split()) > 1 else line}")
+
+        bt = self._run_cmd(["bluetoothctl", "devices", "Connected"])
+        if bt is None:
+            lines.append("· Couldn't run bluetoothctl.")
+        elif bt:
+            for line in bt.splitlines():
+                lines.append(f"✓ Bluetooth connected: {line.replace('Device ', '')}")
+        else:
+            lines.append("✗ No Bluetooth device connected. Reconnect with:")
+            lines.append("    bluetoothctl connect <speaker MAC>   (and 'trust' it so it "
+                         "reconnects by itself after a reboot)")
+
+        self.root.after(0, self._log_lines, lines)
+
+    def _log_lines(self, lines):
+        for line in lines:
+            self._log(line)
+
+    def _speaker_test_followup(self):
+        if self._ask(messagebox.askyesno, "Speaker test", "Did you hear the test phrase?"):
+            self._log("✓ Speaker works - obstacle and delivery announcements will be audible.")
+            return
+        self._log("✗ Nothing heard. Check, in order:")
+        self._log("    1. The speaker is on, connected, and its volume is up")
+        self._log("    2. The lines above: is the default sink the bluez one?")
+        self._log("    3. Over SSH:  espeak-ng \"test\"   - silent too means it's the audio"
+                  " system, not the dashboard")
+        self._log("    4. First word swallowed instead of silence? Increase VOICE_LEAD_IN"
+                  " in dashbord.py")
 
     def _pin_test(self):
         """Hold each motor-signal pin high in turn, to check with a multimeter

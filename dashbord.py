@@ -1210,6 +1210,10 @@ class RobotDashboard:
         self.dir_label = ttk.Label(dir_row, text="—  IDLE", font=("Consolas", 11, "bold"),
                                     foreground=FG_DIM, background=BG_PANEL)
         self.dir_label.pack(side="left", padx=10)
+        # Lives here rather than in the ROBOT LINK row (no space left there),
+        # and this is where its output lands anyway.
+        ttk.Button(dir_row, text="Pin test", style="Small.TButton",
+                   command=self._pin_test).pack(side="right", padx=6)
 
         self.log_text = tk.Text(log_tab, height=10, state="disabled", wrap="word",
                                  bg=BG_INSET, fg=FG_TEXT, insertbackground=ACCENT,
@@ -1869,6 +1873,23 @@ class RobotDashboard:
             return
         self._log("--- Motor test: each side, each way, ~0.6s per burst ---")
         self._send("MTEST")
+        self.notebook.select(self.log_tab)
+
+    def _pin_test(self):
+        """Hold each motor-signal pin high in turn, to check with a multimeter
+        that the Teensy's outputs still work - what a lost common ground
+        damages."""
+        if not (self.ser and self.ser.is_open):
+            self._log("Connect to the robot first.")
+            return
+        if not self._ask(messagebox.askokcancel, "Pin test",
+                         "Unplug the four signal wires (PWM/DIR) from the motor "
+                         "driver first.\n\nEach pin is then held HIGH for 3 seconds: "
+                         "measure it against the Teensy's GND - a healthy pin reads "
+                         "3.3V, a damaged one reads near 0V."):
+            return
+        self._log("--- Pin test: 3s per pin, expect 3.3V on each against Teensy GND ---")
+        self._send("PINTEST")
         self.notebook.select(self.log_tab)
 
     def _gyro_test(self):

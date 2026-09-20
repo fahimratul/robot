@@ -21,6 +21,12 @@ enum ManualMotion { MM_STOP, MM_FWD, MM_BACK, MM_LEFT, MM_RIGHT };
 // =====================================================================
 
 // ---- Cytron MDD10A ----
+// If PINTEST shows one of these pins no longer reaching 3.3V (motor current
+// through the logic side kills them - see PINTEST), just move it: nothing
+// else reads these numbers. Spare Teensy 4.1 pins here are 7, 8, 9, 15, 16,
+// 17, 20, 21, 22; of those 7, 8, 9, 15 and 22 can do PWM, while a DIR pin
+// only needs plain digital output, so any spare will do. Re-flash after
+// changing, and move the wire to match.
 #define PWM_LEFT  2
 #define DIR_LEFT  3
 #define PWM_RIGHT 4
@@ -637,7 +643,8 @@ void updatePath() {
 // and pushes, unprompted: HDG:<deg>,<sign>,<anchor> at 10 Hz (gyro dial),
 // MTURN:<L|R>,<deg> when a manual turn ends (gyro-measured recording).
 //   FOOD  (IR food-tray sensor state)
-//   I2CSCAN, MTEST  (diagnostics: what's on the I2C bus / do the motors run)
+//   I2CSCAN, MTEST, PINTEST  (diagnostics: what's on the I2C bus / do the
+//                             motors run / are the motor pins still alive)
 void processCommand(String cmd) {
   cmd.trim();
 
@@ -746,6 +753,30 @@ void processCommand(String cmd) {
     }
     stopBot();
     Serial.println("MTEST:DONE");
+  } else if (cmd == "PINTEST") {
+    // Diagnostic: hold each motor-signal pin HIGH for long enough to read it
+    // with a multimeter. A healthy Teensy pin sits at 3.3V; a pin damaged by
+    // motor current finding its way back through the logic side (what a lost
+    // common ground causes) reads near 0V, or sags well under 3.3V.
+    // Unplug the four signal wires from the driver first, so what's measured
+    // is the pin itself and nothing else.
+    leaveManualMode();
+    stopPath();
+    Serial.println("OK:PINTEST_START");
+    const int pins[] = {PWM_LEFT, DIR_LEFT, PWM_RIGHT, DIR_RIGHT};
+    const char* names[] = {"PWM_LEFT(pin2)", "DIR_LEFT(pin3)",
+                            "PWM_RIGHT(pin4)", "DIR_RIGHT(pin5)"};
+    for (int i = 0; i < 4; i++) {
+      for (int j = 0; j < 4; j++) digitalWrite(pins[j], LOW);
+      digitalWrite(pins[i], HIGH);
+      Serial.print("PINTEST:");
+      Serial.print(names[i]);
+      Serial.println("=HIGH,expect 3.3V for 3s");
+      delay(3000);
+    }
+    for (int j = 0; j < 4; j++) digitalWrite(pins[j], LOW);
+    stopBot();
+    Serial.println("PINTEST:DONE");
   } else if (cmd == "I2CSCAN") {
     // Diagnostic: what's actually on the I2C bus right now.
     i2cScan();

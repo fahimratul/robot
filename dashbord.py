@@ -92,12 +92,12 @@ VOICE_LEAD_OUT = ", ,"
 
 # Everything the robot says out loud, in one place (pyttsx3 -> espeak-ng).
 SPEAKER_TEST_MSG = "Speaker test. Can you hear me?"        # the Speaker test button
-OBSTACLE_VOICE_MSG = "Please give side"          # something entered the front-180 zone
+OBSTACLE_VOICE_MSG = "Please give please side, you are blocking me"          # something entered the front-180 zone
 STALL_VOICE_MSG = "Robot needs help, please take control"  # still blocked after STALL_ALERT_SECONDS
 
 # ---- Food tray (IR sensor) + automatic return trip ----
-FOOD_TAKEN_VOICE_MSG = "Thank you sir"           # the customer lifted the food off the tray
-RETURN_DONE_VOICE_MSG = "Back at the counter"    # return trip finished
+FOOD_TAKEN_VOICE_MSG = "Thank you sir, thank you sir very much sir"           # the customer lifted the food off the tray
+RETURN_DONE_VOICE_MSG = "Back at the counter, going back to the counter"    # return trip finished
 RETURN_DELAY_SECONDS = 3     # pause after the thank-you before pulling away, so the
                               # customer hears it and steps clear of the robot
 RETURN_TURN_ACTION = "TURN RIGHT"  # which way the robot spins for its two U-turns
@@ -134,6 +134,14 @@ ALIGN_ACTION = "ALIGN TO START"
 DEGREE_ACTIONS = TURN_ACTIONS | {ALIGN_ACTION}
 MANUAL_CMD_TO_PATH_ACTION = {"MFWD": "FORWARD", "MBACK": "BACK",
                              "MLEFT": "LEFT", "MRIGHT": "RIGHT"}
+
+# Steps during which an obstacle in the front-180 zone must stop the robot.
+# Only driving forward can run into what the LiDAR sees: turning on the spot
+# and holding can't, and reversing moves *away* from it. This matters most
+# right after a delivery - the customer who just took the food is standing
+# directly in front, and pausing the return trip's opening U-turn for them
+# left the robot sitting at the table doing nothing.
+OBSTACLE_SENSITIVE_ACTIONS = {"FORWARD"}
 
 # Retracing a path after a 180 degree U-turn: the robot now faces back down
 # the route, so each leg is driven the same way round (FORWARD stays FORWARD,
@@ -792,6 +800,7 @@ class RobotDashboard:
         self.manual_mode = False       # True after MANUAL takeover (phone or desktop)
         self._manual_repeat_job = None  # after() handle for desktop press-and-hold
         self.path_active = False       # True while the Teensy is playing back a PATH
+        self.path_step_index = None    # which step of path_steps is running (PATH_STEP:i/n)
         self.path_steps = []           # [(action_label, value), ...] built in the PATH tab -
                                         # value is seconds, except degrees for TURN LEFT/TURN RIGHT
 
@@ -1361,15 +1370,27 @@ class RobotDashboard:
 
         if line.startswith("OK:PATH_STARTED"):
             self.path_active = True
+            self.path_step_index = 0
             self._update_status()
+        elif line.startswith("PATH_STEP:"):
+            # "PATH_STEP:<i>/<n>", 1-based. Knowing which step is running is
+            # what lets an obstacle pause a forward step without freezing a
+            # turn that can't hit anything.
+            try:
+                self.path_step_index = int(line.split(":", 1)[1].split("/")[0]) - 1
+            except ValueError:
+                self.path_step_index = None
+            self._maybe_pause_for_obstacle()
         elif line == "PATH:DONE":
             self.path_active = False
+            self.path_step_index = None
             self._update_status()
             self._on_path_finished()
         elif line == "OK:PATH_STOPPED":
             # Cancelled, not completed - nothing was delivered, so don't arm
             # a pickup (and abandon a return trip that was cut short).
             self.path_active = False
+            self.path_step_index = None
             self.awaiting_pickup = False
             self.return_active = False
             self._update_status()
@@ -2284,6 +2305,37 @@ class RobotDashboard:
 
         self._handle_obstacle_state(obstacle_found, obstacle_dist)
 
+    def _current_step_action(self):
+        """The action label of the PATH step the robot is running, or None."""
+        if self.path_step_index is None:
+            return None
+        if 0 <= self.path_step_index < len(self.path_steps):
+            return self.path_steps[self.path_step_index][0]
+        return None
+
+    def _maybe_pause_for_obstacle(self):
+        """Pause a running path for an obstacle - but only on a step that
+        drives the robot *into* what the LiDAR can see.
+
+        Called both when an obstacle appears and when the path advances a
+        step, so an obstacle that is still there when a forward step begins
+        stops the robot then instead of being missed.
+        """
+        if not (self.path_active and self.obstacle_active) or self.auto_paused:
+            return
+        action = self._current_step_action()
+        if action is not None and action not in OBSTACLE_SENSITIVE_ACTIONS:
+            # Turning on the spot, holding, or reversing: an obstacle in front
+            # can't be run into, so carry on. Unknown step (None) pauses, as
+            # the cautious default.
+            self._log(f"Obstacle in front, but the robot is on a {action} step - not pausing.")
+            return
+        self._log(f"Obstacle detected at {self.obstacle_dist_mm} mm in front 180 -> PATH_PAUSE")
+        self._send("PATH_PAUSE")
+        self.auto_paused = True
+        self.obstacle_pause_since = time.time()
+        self._update_status()
+
     def _handle_obstacle_state(self, obstacle_found, obstacle_dist):
         self.obstacle_dist_mm = obstacle_dist
         if obstacle_found == self.obstacle_active:
@@ -2298,12 +2350,7 @@ class RobotDashboard:
             self.obstacle_label.config(text=f"⚠ OBSTACLE AT {obstacle_dist} MM — WAITING", foreground=DANGER)
             self._log(f"Voice: \"{OBSTACLE_VOICE_MSG}\"")
             self.speech.speak(OBSTACLE_VOICE_MSG)
-            if self.path_active and not self.auto_paused:
-                self._log(f"Obstacle detected at {obstacle_dist} mm in front 180 -> PATH_PAUSE")
-                self._send("PATH_PAUSE")
-                self.auto_paused = True
-                self.obstacle_pause_since = time.time()
-                self._update_status()
+            self._maybe_pause_for_obstacle()
         else:
             self.obstacle_label.config(text="✓ PATH CLEAR", foreground=SUCCESS)
             if self.auto_paused:

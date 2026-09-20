@@ -223,7 +223,14 @@ Plain text, newline-terminated, replies are `OK:...` / `ERR:...`:
   in `lineflow.ino`), unlike `PATH_STOP` which cancels and resets position.
   Used by `dashbord.py`'s LiDAR obstacle auto-pause: when a path is running
   and an obstacle enters the front-180° zone, it sends `PATH_PAUSE`; resumes
-  with `PATH_RESUME` when clear. Replies `OK:PATH_PAUSED`/`OK:PATH_RESUMED`,
+  with `PATH_RESUME` when clear. **Only on steps in
+  `OBSTACLE_SENSITIVE_ACTIONS` (`FORWARD`)** — turning on the spot, holding
+  and reversing can't drive into what the LiDAR sees, and pausing them was a
+  real failure: the customer who has just taken the food is standing right in
+  front, so the return trip's opening U-turn was paused every single time and
+  the robot never left the table. `dashbord.py` tracks the running step from
+  `PATH_STEP:<i>/<n>` (`path_step_index`) and re-checks on every step change,
+  so an obstacle that is still there when a forward step begins stops it then. Replies `OK:PATH_PAUSED`/`OK:PATH_RESUMED`,
   or `ERR:PATH_NOT_RUNNING` / `ERR:PATH_ALREADY_PAUSED` / `ERR:PATH_NOT_PAUSED`.
 - `FOOD` — query the IR tray sensor → `FOOD:PRESENT` / `FOOD:ABSENT`. The
   dashboard sends this on connect and on `READY` so its tray display starts

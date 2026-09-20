@@ -21,16 +21,19 @@ enum ManualMotion { MM_STOP, MM_FWD, MM_BACK, MM_LEFT, MM_RIGHT };
 // =====================================================================
 
 // ---- Cytron MDD10A ----
-// If PINTEST shows one of these pins no longer reaching 3.3V (motor current
-// through the logic side kills them - see PINTEST), just move it: nothing
-// else reads these numbers. Spare Teensy 4.1 pins here are 7, 8, 9, 15, 16,
-// 17, 20, 21, 22; of those 7, 8, 9, 15 and 22 can do PWM, while a DIR pin
-// only needs plain digital output, so any spare will do. Re-flash after
-// changing, and move the wire to match.
-#define PWM_LEFT  2
-#define DIR_LEFT  3
-#define PWM_RIGHT 4
-#define DIR_RIGHT 5
+// Moved off pins 2/3/4/5 on 2026-09-20: the common ground to the driver came
+// loose while driving, motor current found its way back through the logic
+// side, and PINTEST then showed all four no longer reaching 3.3V. **Pins 2,
+// 3, 4 and 5 are dead - don't reuse them for anything.**
+//
+// If a pin dies again, just move it: nothing else reads these numbers.
+// Remaining spares are 9, 15, 20, 21, 22 (of those 9, 15 and 22 can do PWM;
+// a DIR pin only needs plain digital output, so any spare will do).
+// Re-flash after changing, and move the wire to match.
+#define PWM_LEFT  7
+#define DIR_LEFT  16
+#define PWM_RIGHT 8
+#define DIR_RIGHT 17
 
 // ---- IR food-tray sensor ----
 // A cheap IR obstacle/proximity module (FC-51 style) aimed across the food

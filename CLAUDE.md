@@ -60,13 +60,22 @@ drift from the code.
 
 | Function          | Pins |
 |--------------------|------|
-| Left motor PWM/DIR | 2 / 3 |
-| Right motor PWM/DIR| 4 / 5 |
+| Left motor PWM/DIR | 7 / 16 |
+| Right motor PWM/DIR| 8 / 17 |
 | MPU6050 SDA / SCL  | 18 / 19 (Teensy's default `Wire` bus) |
 | IR food-tray OUT   | 6 (`INPUT_PULLUP`) |
 
-Pins 7-9 and 15-17, 20-22 (formerly encoders and the rest of the QTR array)
-are free.
+Pins 9, 15, 20, 21, 22 are free (9, 15 and 22 can do PWM).
+
+**Pins 2, 3, 4, 5 are dead — do not reuse them.** They were the motor
+PWM/DIR pins until 2026-09-20, when the common ground between the Teensy and
+the MDD10A came loose *while driving*: motor return current went back through
+the logic side and killed all four. The symptom was motors that stopped mid-run
+and never came back, while the dashboard still looked completely healthy —
+`MTEST` ran, `OK:MFWD` came back, and nothing moved. `PINTEST` (hold each
+motor pin HIGH for 3s and measure against Teensy GND: 3.3V healthy, ~0V dead)
+is what identified it. **The common ground is the wire to keep bolted down** —
+screw terminal and thick wire, never a dupont jumper, ideally two of them.
 
 ## Files
 

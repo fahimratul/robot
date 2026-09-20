@@ -16,7 +16,18 @@ set -uo pipefail
 CONF_HOME="${XDG_CONFIG_HOME:-$HOME/.config}/wireplumber"
 WRITTEN=()
 
+# Over SSH these are usually unset, and without them neither `pactl` nor
+# `systemctl --user` can reach the desktop session's audio stack - which
+# looks exactly like "the audio system is broken" if you don't set them.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+
 say() { echo; echo "==> $*"; }
+
+# Can we talk to this user's systemd at all? Not the same question as
+# "is WirePlumber healthy", and confusing the two makes this script roll
+# back a perfectly good config.
+systemd_user_ok() { systemctl --user show-environment >/dev/null 2>&1; }
 
 wp_restart_ok() {
     systemctl --user restart wireplumber >/dev/null 2>&1 || return 1
@@ -25,7 +36,7 @@ wp_restart_ok() {
 }
 
 rollback() {
-    echo "WirePlumber did not come back up - undoing the change."
+    echo "WirePlumber did not come back up after the change - undoing it."
     for f in "${WRITTEN[@]:-}"; do [ -n "$f" ] && rm -f "$f"; done
     systemctl --user restart wireplumber >/dev/null 2>&1
     sleep 1
@@ -41,7 +52,12 @@ if ! command -v pactl >/dev/null 2>&1; then
     exit 1
 fi
 SERVER="$(pactl info 2>/dev/null | grep '^Server Name:' || true)"
-echo "Audio server: ${SERVER#Server Name: }"
+if [ -n "$SERVER" ]; then
+    echo "Audio server: ${SERVER#Server Name: }"
+else
+    echo "Audio server: (can't reach it from this session - the config below is still"
+    echo "               written correctly; it applies at the next login)"
+fi
 
 if command -v wireplumber >/dev/null 2>&1; then
     WP_VER="$(wireplumber --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -n 1)"
@@ -92,8 +108,19 @@ EOF
     esac
 
     printf 'Wrote:'; printf ' %s' "${WRITTEN[@]}"; echo
-    wp_restart_ok || rollback
-    echo "WirePlumber restarted, sinks no longer suspend."
+    if systemd_user_ok; then
+        wp_restart_ok || rollback
+        echo "WirePlumber restarted, sinks no longer suspend."
+    else
+        # Keep the config: it is very probably fine, and there's no evidence
+        # either way from here. It applies at the next login regardless.
+        echo
+        echo "Can't reach this user's service manager from here (usually means an SSH"
+        echo "session without the desktop's environment), so WirePlumber wasn't"
+        echo "restarted. The config is written and takes effect on the next login:"
+        echo "  sudo reboot"
+        echo "Then check it worked with: LOG tab -> Speaker test in the dashboard."
+    fi
 
 elif pgrep -x pulseaudio >/dev/null 2>&1; then
     say "PulseAudio (no WirePlumber)"

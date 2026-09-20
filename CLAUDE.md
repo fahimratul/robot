@@ -135,7 +135,12 @@ screw terminal and thick wire, never a dupont jumper, ideally two of them.
   `--remove` undoes it.
 - `setup_audio.sh` — one-time: stops the audio sink suspending when idle, so
   the Bluetooth speaker stops clipping announcements. Version-aware and
-  self-rolling-back; see "Voice" below.
+  self-rolling-back; see "Voice" below. **Over SSH, `pactl` and
+  `systemctl --user` can't reach the desktop session's audio stack** unless
+  `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS` are exported (the script does
+  this) — an unreachable *service manager* is not the same as a *broken
+  service*, and treating them alike made an earlier version roll back a
+  perfectly good config and claim WirePlumber was down.
 - `setup_teensy_flash.sh` — one-time: installs `arduino-cli` (to
   `~/.local/bin`) + PJRC's `teensy:avr` core, builds `teensy_loader_cli`
   from PJRC's source (older apt builds predate Teensy 4.x), installs PJRC's

@@ -1510,6 +1510,23 @@ class RobotDashboard:
             self.awaiting_pickup = False
             self.return_active = False
             self._update_status()
+        elif line.startswith("TURN:"):
+            # "TURN:<turned>/<target>,<ms>[,TIMEOUT]" - how far a gyro turn
+            # actually got. A turn that stops short is the difference between
+            # the robot setting off in the right direction and not.
+            try:
+                angles, rest = line[len("TURN:"):].split(",", 1)
+                turned, target = (float(v) for v in angles.split("/"))
+                ms = int(rest.split(",")[0])
+            except ValueError:
+                pass
+            else:
+                if "TIMEOUT" in rest:
+                    self._log(f"⚠ Turn ran out of time: {turned:.0f}° of {target:.0f}° "
+                              f"in {ms / 1000:.1f}s. The motors are slower than expected, "
+                              f"or something is blocking the spin.")
+                else:
+                    self._log(f"Turned {turned:.0f}° (asked for {target:.0f}°) in {ms / 1000:.1f}s.")
         elif line.startswith("ALIGN:"):
             # Residual heading error once the ALIGN step finished. Near 0 means
             # the robot really is back on its start heading; a large value

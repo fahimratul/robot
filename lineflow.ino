@@ -169,7 +169,8 @@ int gyroRightSign = 0;
 const double GYRO_SIGN_LEARN_DEG = 5.0;   // rotation needed before the sign is trustworthy
 
 const double ALIGN_TOLERANCE_DEG = 3.0;      // close enough - tighter than this chases gyro noise
-const unsigned long ALIGN_TIMEOUT_MS = 8000; // give up rather than spin forever if the gyro is dead
+// (ALIGN's time limit is turnTimeoutFor() on the turn it's about to make,
+// and with no gyro at all it ends at once rather than spinning blind.)
 
 // ---- Path playback (scripted timed/turn moves) ----
 // A user-authored sequence of steps sent from the dashboard, e.g. "forward
@@ -182,10 +183,17 @@ const unsigned long ALIGN_TIMEOUT_MS = 8000; // give up rather than spin forever
 // delivery path back mirrored plus two 180 degree turns, so a long
 // recorded delivery needs roughly double its own step count.
 #define PATH_MAX_STEPS 64
-#define PATH_TURN_TIMEOUT_MS 8000  // safety cap per turn in case the gyro/mount is bad - TUNE.
-                                    // Must comfortably exceed a real 180 degree
-                                    // turn at nudgeSpeed, or the return trip's
-                                    // U-turns get cut short by the timeout.
+
+// A turn's timeout is a safety net for a dead gyro, NOT a limit on how long
+// a real turn may take - so it scales with the angle asked for. A flat cap
+// (8s for everything, up to 2026-09-20) quietly cut 180 degree U-turns short
+// on this robot: they take longer than a 90, so the return trip set off
+// still half-facing the table. 100ms per degree = a floor of 10 deg/s, well
+// under anything the motors actually manage.
+const unsigned long TURN_TIMEOUT_MS_PER_DEG = 100;
+const unsigned long TURN_TIMEOUT_MIN_MS = 3000;
+const unsigned long TURN_TIMEOUT_MAX_MS = 20000;
+unsigned long stepTimeoutMs = 0;   // for the turn/align step running now
 
 PathAction    pathActions[PATH_MAX_STEPS];
 unsigned long pathDurations[PATH_MAX_STEPS];  // ms for timed actions, DEGREES for TURNL/TURNR
@@ -499,12 +507,23 @@ void maintainAlign() {
 }
 
 // ---- Path playback ----
+// How long to allow a turn of this many degrees before giving up on it.
+unsigned long turnTimeoutFor(double degrees) {
+  unsigned long ms = (unsigned long)(fabs(degrees) * TURN_TIMEOUT_MS_PER_DEG);
+  return constrain(ms, TURN_TIMEOUT_MIN_MS, TURN_TIMEOUT_MAX_MS);
+}
+
 void applyPathAction(PathAction action) {
+  if (action == PATH_TURN_LEFT || action == PATH_TURN_RIGHT) {
+    stepTimeoutMs = turnTimeoutFor((double)pathDurations[pathStepIndex]);
+  }
   if (action == PATH_ALIGN) {
     // Target is relative to the anchor, not to wherever this step begins -
     // that's the whole point: it's an absolute heading, so accumulated error
     // from every step before it gets corrected here rather than carried on.
     alignTargetDeg = anchorHeadingDeg + (double)pathDurations[pathStepIndex];
+    // Budget for the turn it is actually about to make, not a flat cap.
+    stepTimeoutMs = turnTimeoutFor(alignErrorDeg());
     stopBot();  // maintainAlign() takes over from the next iteration
     return;
   }
@@ -597,18 +616,31 @@ void updatePath() {
   unsigned long elapsed = millis() - pathStepStartTime;
 
   bool stepDone;
+  double turnedDeg = fabs(currentHeadingDeg - pathStepStartHeadingDeg);
   if (isTurn) {
-    double turnedDeg = fabs(currentHeadingDeg - pathStepStartHeadingDeg);
-    stepDone = (turnedDeg >= (double)pathDurations[pathStepIndex]) || (elapsed >= PATH_TURN_TIMEOUT_MS);
+    stepDone = (turnedDeg >= (double)pathDurations[pathStepIndex]) || (elapsed >= stepTimeoutMs);
   } else if (isAlign) {
-    // maintainAlign() is doing the steering; this only decides when to move on.
-    stepDone = (mpuReady && fabs(alignErrorDeg()) <= ALIGN_TOLERANCE_DEG)
-               || (elapsed >= ALIGN_TIMEOUT_MS);
+    // maintainAlign() is doing the steering; this only decides when to move
+    // on. With no gyro it can't work at all, so end it at once rather than
+    // spin blind until a timeout.
+    stepDone = !mpuReady || (fabs(alignErrorDeg()) <= ALIGN_TOLERANCE_DEG)
+               || (elapsed >= stepTimeoutMs);
   } else {
     stepDone = (elapsed >= pathDurations[pathStepIndex]);
   }
   if (!stepDone) return;
 
+  if (isTurn) {
+    // Say how far it actually got, and whether it ran out of time getting
+    // there - a turn that stops short otherwise looks like a gyro fault.
+    Serial.print("TURN:");
+    Serial.print(turnedDeg, 1);
+    Serial.print("/");
+    Serial.print(pathDurations[pathStepIndex]);
+    Serial.print(",");
+    Serial.print(elapsed);
+    Serial.println(turnedDeg < (double)pathDurations[pathStepIndex] ? ",TIMEOUT" : "");
+  }
   if (isTurn || action == PATH_LEFT || action == PATH_RIGHT) {
     // A deliberate turn of known direction is the one moment the gyro's sign
     // convention is observable for free - remember it for ALIGN steps and

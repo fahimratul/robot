@@ -476,11 +476,19 @@ button that runs the retrace without waiting for the sensor (also on the
 phone page as **↩ RETURN HOME**, plus a tray-status line). `STOP`, manual
 takeover and starting another path all cancel a pending return.
 
-The two U-turns are `TURNR,180` gyro turns, so they need the MPU6050. With
-no gyro they fall back to spinning until `PATH_TURN_TIMEOUT_MS` (raised to
-8000ms, since a real 180° turn at `nudgeSpeed` can exceed the old 5s cap and
-get cut short). `RETURN_TURN_ACTION`/`RETURN_TURN_DEGREES` in `dashbord.py`
-change the spin direction/angle.
+The two U-turns are `TURNR,180` gyro turns, so they need the MPU6050.
+`RETURN_TURN_ACTION`/`RETURN_TURN_DEGREES` in `dashbord.py` change the spin
+direction/angle.
+
+**A turn's time limit scales with its angle** (`turnTimeoutFor()`:
+`TURN_TIMEOUT_MS_PER_DEG` 100ms/°, clamped to 3–20s) rather than one flat
+cap. It exists for a dead gyro, not to limit how long a real turn may take —
+observed on hardware 2026-09-20: the flat 8s cap was cutting the return
+trip's 180° U-turns short, so the robot set off still half-facing the table
+while every individual part looked fine. Each gyro turn now reports
+`TURN:<turned>/<target>,<ms>[,TIMEOUT]`, which the dashboard logs in plain
+words, so a turn that stops short says so instead of looking like a gyro
+fault.
 
 ## Line-following and encoder odometry — removed (2026-09-18)
 

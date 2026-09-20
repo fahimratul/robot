@@ -141,6 +141,23 @@ screw terminal and thick wire, never a dupont jumper, ideally two of them.
   end-to-end "firmware running + gyro up" test. A dashboard connected at the
   time loses its link when the Teensy reboots — Disconnect/Connect after.
 
+### Voice (pyttsx3 → espeak-ng, Bluetooth speaker)
+
+Four spoken messages, all constants at the top of `dashbord.py`:
+`OBSTACLE_VOICE_MSG` (something enters the front-180 zone),
+`STALL_VOICE_MSG` (still blocked after `STALL_ALERT_SECONDS`),
+`FOOD_TAKEN_VOICE_MSG`, `RETURN_DONE_VOICE_MSG`. Every one is also written to
+the log as `Voice: "..."`, so the log still shows what it tried to say when
+nothing is audible.
+
+The speaker is **Bluetooth**, so its A2DP link sleeps when idle and swallows
+whatever is said in the ~1s it takes to wake. `VOICE_LEAD_IN` (a couple of
+commas, prepended in `SpeechWorker._run`) makes espeak emit a short silence
+first so the stream is live before the words start. The system-side half of
+that fix is stopping the audio sink suspending at all — WirePlumber
+`session.suspend-timeout-seconds = 0`. Note the obstacle line is spoken on
+*every* transition into the zone, even when no path is running.
+
 ## Serial protocol (Teensy ⇄ Pi) — current
 
 Plain text, newline-terminated, replies are `OK:...` / `ERR:...`:

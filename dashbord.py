@@ -78,11 +78,19 @@ try:
 except ImportError:
     pyttsx3 = None  # voice alerts are skipped if this isn't installed
 
-OBSTACLE_VOICE_MSG = "Please give side"
+# A Bluetooth speaker's A2DP link takes a moment to wake up from idle, and
+# whatever is said in that gap is lost - the first word or two. The commas
+# make espeak generate a short silence first, so the stream is already
+# running by the time the words start. Set to "" for a wired speaker.
+VOICE_LEAD_IN = ", , "
+
+# Everything the robot says out loud, in one place (pyttsx3 -> espeak-ng).
+OBSTACLE_VOICE_MSG = "Please give side"          # something entered the front-180 zone
+STALL_VOICE_MSG = "Robot needs help, please take control"  # still blocked after STALL_ALERT_SECONDS
 
 # ---- Food tray (IR sensor) + automatic return trip ----
-FOOD_TAKEN_VOICE_MSG = "Thank you sir"
-RETURN_DONE_VOICE_MSG = "Back at the counter"
+FOOD_TAKEN_VOICE_MSG = "Thank you sir"           # the customer lifted the food off the tray
+RETURN_DONE_VOICE_MSG = "Back at the counter"    # return trip finished
 RETURN_DELAY_SECONDS = 3     # pause after the thank-you before pulling away, so the
                               # customer hears it and steps clear of the robot
 RETURN_TURN_ACTION = "TURN RIGHT"  # which way the robot spins for its two U-turns
@@ -324,7 +332,7 @@ class SpeechWorker:
         while True:
             text = self._queue.get()
             try:
-                self._engine.say(text)
+                self._engine.say(VOICE_LEAD_IN + text)
                 self._engine.runAndWait()
             except Exception:
                 pass
@@ -1788,7 +1796,7 @@ class RobotDashboard:
             self.alert_active = True
             self._log(f"⚠ ALERT: robot has been blocked by an obstacle for over "
                       f"{STALL_ALERT_SECONDS}s — take manual control from your phone.")
-            self.speech.speak("Robot needs help, please take control")
+            self.speech.speak(STALL_VOICE_MSG)
             self.alert_label.config(text="⚠ NEEDS HELP: BLOCKED — USE PHONE/MANUAL", foreground=DANGER)
         elif not stalled and self.alert_active:
             self._clear_alert()

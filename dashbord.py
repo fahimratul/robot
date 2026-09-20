@@ -149,6 +149,9 @@ REVERSE_ACTION_MIRROR = {"FORWARD": "FORWARD", "BACK": "BACK", "HOLD": "HOLD",
 # Library of named PATH step-sequences, persisted next to this script so
 # they survive a dashboard restart.
 SAVED_PATHS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_paths.json")
+# Save As pre-fills "<prefix> N" (first free N) so a path can be saved by
+# tapping OK - the robot's on-screen keyboard is turned off.
+SAVED_PATH_NAME_PREFIX = "Table"
 MIN_RECORDED_GAP_SECONDS = 0.3  # idle gaps shorter than this aren't recorded as a HOLD step
 MIN_RECORDED_TURN_DEG = 2       # a gyro-measured turn smaller than this stays a timed nudge
 MTURN_MATCH_WINDOW_S = 1.0      # an MTURN report pairs with a recorded turn at most this old
@@ -1745,11 +1748,22 @@ class RobotDashboard:
             return None
         return sorted(self.saved_paths)[sel[0]]
 
+    def _next_path_name(self):
+        """First unused "Table N" - a default that needs no typing."""
+        n = 1
+        while f"{SAVED_PATH_NAME_PREFIX} {n}" in self.saved_paths:
+            n += 1
+        return f"{SAVED_PATH_NAME_PREFIX} {n}"
+
     def _save_current_path_as(self):
         if not self.path_steps:
             self._log("Nothing to save - add steps or record a drive first.")
             return
-        name = self._ask(simpledialog.askstring, "Save Path", "Name this path:")
+        # Pre-filled so it can be saved with OK alone: the on-screen keyboard
+        # is usually turned off on the robot (it pops up over the dashboard),
+        # which would otherwise make naming a path impossible by touch.
+        name = self._ask(simpledialog.askstring, "Save Path", "Name this path:",
+                         initialvalue=self._next_path_name())
         if not name:
             return
         name = name.strip()

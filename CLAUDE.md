@@ -90,9 +90,13 @@ screw terminal and thick wire, never a dupont jumper, ideally two of them.
   covering the desktop taskbar and title bar); the header's "Exit full
   screen" button is the touch way out since there's no close button (Esc /
   F11 too), and `DASHBOARD_WINDOWED=1` starts windowed for PC development.
-  **No text typing outside Save As**: both Spinboxes are `state="readonly"`
+  **No text typing needed anywhere**: both Spinboxes are `state="readonly"`
   (arrows still work), because a focused text field pops the touchscreen's
-  on-screen keyboard up over the dashboard. A **Gyro test** button in the
+  on-screen keyboard up over the dashboard; and Save As pre-fills the next
+  free "Path N" so it can be saved with OK alone. The robot's on-screen
+  keyboard is turned off outright
+  (`gsettings set org.gnome.desktop.a11y.applications screen-keyboard-enabled false`),
+  so nothing in the UI may *require* typing. A **Gyro test** button in the
   ROBOT LINK row sends `GYRO` + `I2CSCAN` and jumps to the LOG tab — the
   robot has no keyboard, so that button is the only way to run those.
   Save As drops out of fullscreen while its name dialog is open — it's the

@@ -637,6 +637,7 @@ void updatePath() {
 // and pushes, unprompted: HDG:<deg>,<sign>,<anchor> at 10 Hz (gyro dial),
 // MTURN:<L|R>,<deg> when a manual turn ends (gyro-measured recording).
 //   FOOD  (IR food-tray sensor state)
+//   I2CSCAN, MTEST  (diagnostics: what's on the I2C bus / do the motors run)
 void processCommand(String cmd) {
   cmd.trim();
 
@@ -718,6 +719,33 @@ void processCommand(String cmd) {
     Serial.print(mpuWhoAmI, HEX);
     Serial.print(",SIGN=");
     Serial.println(gyroRightSign);
+  } else if (cmd == "MTEST") {
+    // Diagnostic: drive each side, each way, for a fixed burst - bypassing
+    // manual mode, the dead-man's switch and path playback entirely. If the
+    // wheels don't move for this, the problem is past the Teensy (driver
+    // power, a missing common ground, or the motor wiring), not in the
+    // command path. Deliberately blocking: nothing else should run during it
+    // (so STOP can't interrupt either - keep the wheels off the ground).
+    leaveManualMode();
+    stopPath();
+    Serial.println("OK:MTEST_START");
+    const int testPwm = 150;  // well above the usual speeds, to beat friction
+    for (int side = 0; side < 2; side++) {
+      int pwmPin = side ? PWM_RIGHT : PWM_LEFT;
+      int dirPin = side ? DIR_RIGHT : DIR_LEFT;
+      for (int dir = 0; dir < 2; dir++) {
+        Serial.print("MTEST:");
+        Serial.print(side ? "RIGHT_" : "LEFT_");
+        Serial.println(dir ? "BACK" : "FWD");
+        digitalWrite(dirPin, dir ? LOW : HIGH);
+        analogWrite(pwmPin, testPwm);
+        delay(600);
+        analogWrite(pwmPin, 0);
+        delay(300);
+      }
+    }
+    stopBot();
+    Serial.println("MTEST:DONE");
   } else if (cmd == "I2CSCAN") {
     // Diagnostic: what's actually on the I2C bus right now.
     i2cScan();

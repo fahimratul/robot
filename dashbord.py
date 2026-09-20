@@ -59,7 +59,7 @@ import socketserver
 import threading
 import time
 import tkinter as tk
-from tkinter import simpledialog, ttk
+from tkinter import messagebox, simpledialog, ttk
 from urllib.parse import urlparse
 
 import serial
@@ -988,7 +988,9 @@ class RobotDashboard:
                                       font=FONT_STATUS)
         self.conn_status.grid(row=0, column=3, padx=6)
         ttk.Button(conn_frame, text="Gyro test", style="Small.TButton",
-                   command=self._gyro_test).grid(row=0, column=4, padx=6)
+                   command=self._gyro_test).grid(row=0, column=4, padx=(6, 2))
+        ttk.Button(conn_frame, text="Motor test", style="Small.TButton",
+                   command=self._motor_test).grid(row=0, column=5, padx=(2, 6))
 
         self.phone_url_label = ttk.Label(conn_frame, text="Phone remote: starting...",
                                           font=("Consolas", 8), foreground=FG_DIM,
@@ -1721,18 +1723,7 @@ class RobotDashboard:
         if not self.path_steps:
             self._log("Nothing to save - add steps or record a drive first.")
             return
-        # The only typed input in the app. Drop out of fullscreen while it's
-        # open: a fullscreen window can cover the touchscreen's on-screen
-        # keyboard, and on some window managers the dialog itself opens
-        # *behind* it - a modal nobody can see looks like a frozen app.
-        was_fullscreen = self.fullscreen
-        if was_fullscreen:
-            self._set_fullscreen(False)
-        try:
-            name = simpledialog.askstring("Save Path", "Name this path:", parent=self.root)
-        finally:
-            if was_fullscreen:
-                self._set_fullscreen(True)
+        name = self._ask(simpledialog.askstring, "Save Path", "Name this path:")
         if not name:
             return
         name = name.strip()
@@ -1847,6 +1838,38 @@ class RobotDashboard:
             return
         self._last_hdg_time = time.time()
         self._draw_heading_dial()
+
+    def _ask(self, dialog, *args, **kwargs):
+        """Show a dialog with fullscreen dropped for the duration.
+
+        A fullscreen window can cover the touchscreen's on-screen keyboard,
+        and on some window managers the dialog itself opens *behind* it - a
+        modal nobody can see looks like a frozen app.
+        """
+        was_fullscreen = self.fullscreen
+        if was_fullscreen:
+            self._set_fullscreen(False)
+        try:
+            return dialog(*args, parent=self.root, **kwargs)
+        finally:
+            if was_fullscreen:
+                self._set_fullscreen(True)
+
+    def _motor_test(self):
+        """Drive each motor directly on the Teensy, bypassing manual mode, the
+        dead-man's switch and path playback - so "nothing moves" can be pinned
+        on the wiring/driver rather than the command path."""
+        if not (self.ser and self.ser.is_open):
+            self._log("Connect to the robot first.")
+            return
+        if not self._ask(messagebox.askokcancel, "Motor test",
+                         "The robot will drive each motor forwards and backwards "
+                         "for about 3 seconds.\n\nLift the wheels off the ground "
+                         "first - STOP cannot interrupt this test."):
+            return
+        self._log("--- Motor test: each side, each way, ~0.6s per burst ---")
+        self._send("MTEST")
+        self.notebook.select(self.log_tab)
 
     def _gyro_test(self):
         """Ask the Teensy what it can see on the I2C bus, and show the answer.

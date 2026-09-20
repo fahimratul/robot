@@ -36,6 +36,9 @@ drift from the code.
   MPU6500/9250 clones reporting 0x70/0x72/0x73, whose gyro registers are
   identical. Refusing on WHO_AM_I != 0x68 (the pre-2026-09-20 check) is a
   likely cause of a "gyro not detected" that is actually wired fine.
+  **This robot's module is such a clone**: confirmed on hardware
+  2026-09-20 reporting `ADDR=0x68,WHOAMI=0x74`, which the old check
+  rejected — that was the real cause of its "gyro not detected".
   I2C gyro/accel breakout (GY-521 style),
   read on the Teensy via a minimal raw-I2C driver in `lineflow.ino` (no
   extra Arduino library). Only the Z-axis gyro is used, for heading — see

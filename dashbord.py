@@ -80,11 +80,15 @@ try:
 except ImportError:
     pyttsx3 = None  # voice alerts are skipped if this isn't installed
 
-# A Bluetooth speaker's A2DP link takes a moment to wake up from idle, and
-# whatever is said in that gap is lost - the first word or two. The commas
-# make espeak generate a short silence first, so the stream is already
-# running by the time the words start. Set to "" for a wired speaker.
-VOICE_LEAD_IN = ", , "
+# A Bluetooth speaker's A2DP link takes about a second to wake from idle, and
+# whatever is said in that gap is lost. The commas make espeak generate
+# silence around the words, so the stream is already running when the words
+# start and hasn't been torn down before they finish (both ends get clipped).
+# Set both to "" for a wired speaker; lengthen the lead-in if the first word
+# is still being swallowed. The real fix is setup_audio.sh, which stops the
+# sink suspending at all - this just covers what that can't.
+VOICE_LEAD_IN = ", , , "
+VOICE_LEAD_OUT = ", ,"
 
 # Everything the robot says out loud, in one place (pyttsx3 -> espeak-ng).
 SPEAKER_TEST_MSG = "Speaker test. Can you hear me?"        # the Speaker test button
@@ -335,7 +339,7 @@ class SpeechWorker:
         while True:
             text = self._queue.get()
             try:
-                self._engine.say(VOICE_LEAD_IN + text)
+                self._engine.say(VOICE_LEAD_IN + text + VOICE_LEAD_OUT)
                 self._engine.runAndWait()
             except Exception:
                 pass

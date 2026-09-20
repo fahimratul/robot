@@ -124,6 +124,9 @@ screw terminal and thick wire, never a dupont jumper, ideally two of them.
   session; needs automatic desktop login (the Pi runs **Ubuntu**: Settings
   → System → Users → Automatic Login — there is no `raspi-config`).
   `--remove` undoes it.
+- `setup_audio.sh` — one-time: stops the audio sink suspending when idle, so
+  the Bluetooth speaker stops clipping announcements. Version-aware and
+  self-rolling-back; see "Voice" below.
 - `setup_teensy_flash.sh` — one-time: installs `arduino-cli` (to
   `~/.local/bin`) + PJRC's `teensy:avr` core, builds `teensy_loader_cli`
   from PJRC's source (older apt builds predate Teensy 4.x), installs PJRC's
@@ -159,12 +162,23 @@ hear it?" and prints what to check on a no. `pactl`/`bluetoothctl` run off
 the Tk thread and are treated as optional (absent on a dev PC).
 
 The speaker is **Bluetooth**, so its A2DP link sleeps when idle and swallows
-whatever is said in the ~1s it takes to wake. `VOICE_LEAD_IN` (a couple of
-commas, prepended in `SpeechWorker._run`) makes espeak emit a short silence
-first so the stream is live before the words start. The system-side half of
-that fix is stopping the audio sink suspending at all — WirePlumber
-`session.suspend-timeout-seconds = 0`. Note the obstacle line is spoken on
-*every* transition into the zone, even when no path is running.
+whatever is said in the ~1s it takes to wake — and a sink that suspends
+mid-sentence chops the rest. Two halves to the fix:
+
+- `VOICE_LEAD_IN` / `VOICE_LEAD_OUT` (commas, wrapped around the text in
+  `SpeechWorker._run`) make espeak emit silence at both ends, so the stream
+  is live before the words start and still up when they finish.
+- `setup_audio.sh` stops the sink suspending at all. **The config format
+  depends on the WirePlumber version** — 0.4 is Lua in `main.lua.d/` +
+  `bluetooth.lua.d/`, 0.5+ is SPA-JSON in `wireplumber.conf.d/` — and
+  writing the wrong one stops WirePlumber starting at all (this happened
+  2026-09-20). The script detects the version, and rolls its own files back
+  if the service doesn't come back up. It also reports the Bluetooth card's
+  active profile: `headset`/`hfp` is the call profile (low quality, chops),
+  `a2dp-sink` is the one for playback.
+
+Note the obstacle line is spoken on *every* transition into the zone, even
+when no path is running.
 
 ## Serial protocol (Teensy ⇄ Pi) — current
 

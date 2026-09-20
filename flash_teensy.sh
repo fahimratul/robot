@@ -98,7 +98,8 @@ DASHBOARD_HAD_PORT=0
 if [ -n "$PORT" ] && fuser "$PORT" >/dev/null 2>&1; then
     DASHBOARD_HAD_PORT=1
     echo "Note: something (probably the dashboard) has the Teensy's port open."
-    echo "      Flashing still works, but that connection dies when the Teensy reboots."
+    echo "      Flashing still works; that connection drops when the Teensy reboots"
+    echo "      and the dashboard reconnects by itself a few seconds later."
 fi
 
 if [ -n "$PORT" ]; then
@@ -150,5 +151,5 @@ fi
 echo
 echo "Keep the robot still for a few seconds after a flash - the gyro calibrates at boot."
 if [ "$DASHBOARD_HAD_PORT" -eq 1 ]; then
-    echo "In the dashboard: Disconnect, then Connect again to pick the Teensy back up."
+    echo "The dashboard picks the Teensy back up on its own within a few seconds."
 fi

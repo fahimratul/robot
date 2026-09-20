@@ -114,6 +114,15 @@ MIN_QUALITY = 5            # ignore very low-confidence points
 MAP_MAX_RANGE_MM = 4000    # canvas display range (outer ring)
 FRONT_HALF_ANGLE = 90      # "front 180" = heading +/- 90 degrees
 
+# The robot's two USB serial devices, identified by USB vendor/product id so
+# a shuffled /dev name doesn't matter. Names are the fallback only.
+TEENSY_USB_ID = (0x16C0, 0x0483)   # Teensyduino USB Serial
+TEENSY_PORT_FALLBACK = "/dev/ttyACM0"
+LIDAR_USB_ID = (0x10C4, 0xEA60)    # Silicon Labs CP2102N on the RPLidar C1's adapter
+LIDAR_PORT_FALLBACK = "/dev/ttyUSB0"
+AUTO_CONNECT_POLL_SECONDS = 3      # how often to look for a device that isn't connected
+AUTO_CONNECT_RETRY_SECONDS = 20    # back off this long after a failed attempt
+
 PHONE_SERVER_PORT = 8765   # phone remote control - browse to http://<laptop-lan-ip>:8765
 STALL_ALERT_SECONDS = 10   # alert the phone if stopped this long (line lost or obstacle)
 MANUAL_COMMANDS = {"MFWD", "MBACK", "MLEFT", "MRIGHT", "MSTOP"}
@@ -801,6 +810,14 @@ class RobotDashboard:
         self._manual_repeat_job = None  # after() handle for desktop press-and-hold
         self.path_active = False       # True while the Teensy is playing back a PATH
         self.path_step_index = None    # which step of path_steps is running (PATH_STEP:i/n)
+
+        # ---- Auto-connect ----
+        # On by default: the robot boots straight into this with no keyboard.
+        # DASHBOARD_NO_AUTOCONNECT=1 turns it off for bench work on a PC.
+        auto = not os.environ.get("DASHBOARD_NO_AUTOCONNECT")
+        self.autoconnect_robot = auto
+        self.autoconnect_lidar = auto
+        self._autoconnect_retry_after = 0.0
         self.path_steps = []           # [(action_label, value), ...] built in the PATH tab -
                                         # value is seconds, except degrees for TURN LEFT/TURN RIGHT
 
@@ -866,6 +883,7 @@ class RobotDashboard:
         self._draw_heading_dial()
         self._block_touch_keyboard()
         self._set_fullscreen(self.fullscreen)
+        self._auto_connect_tick()
         self._refresh_map()  # start the periodic canvas/obstacle-check loop
         self._start_phone_server()
 
@@ -1239,7 +1257,7 @@ class RobotDashboard:
         self.lidar_port_combo.grid(row=0, column=0, padx=6, pady=6)
         ttk.Button(lidar_conn_frame, text="Refresh", command=self._refresh_ports).grid(row=0, column=1, padx=4)
         self.lidar_connect_btn = ttk.Button(lidar_conn_frame, text="Connect LiDAR",
-                                             command=self._toggle_lidar_connect)
+                                             command=self._toggle_lidar_connect_user)
         self.lidar_connect_btn.grid(row=0, column=2, padx=6)
 
         ttk.Label(lidar_conn_frame, text="Obstacle (mm):").grid(row=0, column=3, padx=(12, 4))
@@ -1293,22 +1311,108 @@ class RobotDashboard:
         self.canvas_size = max(100, min(event.width, event.height))
 
     # ---------------- Port list ----------------
+    @staticmethod
+    def _find_port(usb_id, fallback):
+        """The device path for a known peripheral, or None.
+
+        Matched on USB vendor/product id rather than the device name: the
+        robot's Teensy is /dev/ttyACM0 and its LiDAR /dev/ttyUSB0 *today*,
+        but those numbers move if something else is plugged in first, or if
+        one of them is replugged. The name is only the fallback.
+        """
+        ports = list(serial.tools.list_ports.comports())
+        for port in ports:
+            if (port.vid, port.pid) == usb_id:
+                return port.device
+        for port in ports:
+            if port.device == fallback:
+                return port.device
+        return None
+
     def _refresh_ports(self):
         ports = [p.device for p in serial.tools.list_ports.comports()]
         self.port_combo["values"] = ports
         self.lidar_port_combo["values"] = ports
+        # Preselect what each device actually is, instead of first/last in the
+        # list, so the dropdowns are already right if connecting by hand.
+        teensy = self._find_port(TEENSY_USB_ID, TEENSY_PORT_FALLBACK)
+        lidar = self._find_port(LIDAR_USB_ID, LIDAR_PORT_FALLBACK)
+        if teensy and not self.port_var.get():
+            self.port_var.set(teensy)
+        if lidar and lidar != teensy and not self.lidar_port_var.get():
+            self.lidar_port_var.set(lidar)
         if ports:
             if not self.port_var.get():
                 self.port_var.set(ports[0])
             if not self.lidar_port_var.get():
                 self.lidar_port_var.set(ports[-1])
 
+    # ---------------- Auto-connect ----------------
+    def _auto_connect_tick(self):
+        """Connect to whatever is plugged in, and reconnect if it comes back.
+
+        The robot boots into this dashboard with no keyboard, so waiting for
+        someone to tap Connect isn't useful. It also picks the links back up
+        by itself after the Teensy is re-flashed (its port disappears and
+        returns). Tapping Disconnect turns this off for that link, so a
+        deliberate disconnect stays disconnected.
+        """
+        now = time.time()
+        if (self.autoconnect_robot and not (self.ser and self.ser.is_open)
+                and now >= self._autoconnect_retry_after):
+            port = self._find_port(TEENSY_USB_ID, TEENSY_PORT_FALLBACK)
+            if port:
+                self.port_var.set(port)
+                self._log(f"Auto-connecting to the robot on {port}...")
+                if not self._connect():
+                    # Don't retry every few seconds: a failure here is usually
+                    # permissions or another program holding the port, and
+                    # would just fill the log.
+                    self._autoconnect_retry_after = now + AUTO_CONNECT_RETRY_SECONDS
+                    self._log(f"Auto-connect failed - retrying in "
+                              f"{AUTO_CONNECT_RETRY_SECONDS}s.")
+
+        if self.autoconnect_lidar and self.lidar_worker is None and C1Lidar is not None:
+            port = self._find_port(LIDAR_USB_ID, LIDAR_PORT_FALLBACK)
+            if port and port != (self.ser.port if self.ser else None):
+                self.lidar_port_var.set(port)
+                self._log(f"Auto-connecting to the LiDAR on {port}...")
+                self._toggle_lidar_connect()
+
+        self.root.after(int(AUTO_CONNECT_POLL_SECONDS * 1000), self._auto_connect_tick)
+
     # ---------------- Robot serial ----------------
     def _toggle_connect(self):
+        # A tap on Connect asks for it to stay connected; a tap on Disconnect
+        # means stop, and auto-connect must not undo that.
+        self.autoconnect_robot = not (self.ser and self.ser.is_open)
+        self._autoconnect_retry_after = 0
         if self.ser and self.ser.is_open:
             self._disconnect()
         else:
             self._connect()
+
+    def _connect(self):
+        port = self.port_var.get()
+        if not port:
+            self._log("No robot port selected.")
+            return False
+        try:
+            self.ser = serial.Serial(port, 9600, timeout=1)
+            time.sleep(2)  # allow Teensy to reset/boot
+            self.reader_running = True
+            threading.Thread(target=self._read_loop, daemon=True).start()
+
+            self.conn_status.config(text=f"● CONNECTED ({port})", foreground=SUCCESS)
+            self.connect_btn.config(text="Disconnect")
+            self.stop_btn.config(state="normal")
+            self._log(f"Connected to robot on {port}")
+            self._send("FOOD")  # tray state now, rather than waiting for the next pickup
+            return True
+        except Exception as e:
+            self.ser = None
+            self._log(f"Connection failed: {e}")
+            return False
 
     def _connect(self):
         port = self.port_var.get()
@@ -1355,8 +1459,20 @@ class RobotDashboard:
                 line = self.ser.readline().decode(errors="ignore").strip()
                 if line:
                     self.root.after(0, self._on_robot_line, line)
-            except Exception:
-                break
+            except Exception as e:
+                # The Teensy went away - unplugged, or re-flashed and
+                # rebooting. Hand it to the Tk thread so the port is closed
+                # properly and auto-connect can pick it up when it returns;
+                # left open, the dashboard would look connected forever.
+                if self.reader_running:
+                    self.root.after(0, self._on_link_lost, str(e))
+                return
+
+    def _on_link_lost(self, reason):
+        if not (self.ser and self.ser.is_open):
+            return
+        self._log(f"Robot link lost ({reason}).")
+        self._disconnect()
 
     def _on_robot_line(self, line):
         # High-rate telemetry first, and kept out of the log: HDG arrives 10x a
@@ -2199,6 +2315,11 @@ class RobotDashboard:
         c.create_polygon(rotated, fill=color, outline="")
 
     # ---------------- LiDAR ----------------
+    def _toggle_lidar_connect_user(self):
+        """The button. Disconnecting by hand must stay disconnected."""
+        self.autoconnect_lidar = self.lidar_worker is None
+        self._toggle_lidar_connect()
+
     def _toggle_lidar_connect(self):
         if self.lidar_worker:
             self.lidar_worker.stop()

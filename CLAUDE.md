@@ -109,7 +109,16 @@ screw terminal and thick wire, never a dupont jumper, ideally two of them.
   or hide the dialog behind itself. The CONTROL tab is tight at 800x480:
   STOP shares a row with the state/alert text so the FOOD TRAY panel fits
   (~60px spare) — check new CONTROL-tab rows against that height. Owns two serial links (Teensy +
-  RPLidar C1 directly), draws the live LiDAR radar/map, auto-pauses a
+  RPLidar C1 directly) and **connects to both by itself**:
+  `_auto_connect_tick` runs every `AUTO_CONNECT_POLL_SECONDS` and matches on
+  USB vendor/product id (`TEENSY_USB_ID` `16c0:0483`, `LIDAR_USB_ID`
+  `10c4:ea60`) rather than the `/dev/ttyACM0` / `/dev/ttyUSB0` names, which
+  move when devices are replugged. A read failure closes the link
+  (`_on_link_lost`) instead of leaving it looking connected, so it also picks
+  the Teensy back up after a re-flash. Tapping Disconnect turns auto-connect
+  off for that link until Connect is tapped again;
+  `DASHBOARD_NO_AUTOCONNECT=1` disables it for bench work. Draws the live
+  LiDAR radar/map, auto-pauses a
   running PATH when something enters the front-180° obstacle zone and
   auto-resumes when clear, alerts (voice + phone vibration) if blocked
   >10s, lets the user build/record/save/run scripted timed-move sequences
